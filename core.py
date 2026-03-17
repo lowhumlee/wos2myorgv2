@@ -268,23 +268,26 @@ def extract_muv_author_pairs(wos_records: List[Dict], cfg: dict) -> List[Dict]:
 
         # ── C3 fallback: record-level MUV disambiguation ──────────────────────
         # WoS C3 lists disambiguated institution names for the whole record.
-        # When C3 contains MUV but an author's C1 block shows only a clinical
-        # partner hospital (e.g. "Univ Hosp St Marina Varna"), that author is
-        # silently dropped by the primary C1 pass.
+        # Some C1 affiliation strings don't contain enough text for pattern
+        # matching (e.g. "Med Univ, Dept ..., Varna" — just two words with no
+        # "Varna" adjacent) or use a clinical partner hospital name.
         #
-        # Fix: if C3 has MUV, scan C1 blocks whose affiliation is NOT MUV but
-        # IS a known MUV clinical partner.  Credit those authors as MUV.
+        # Strategy (two tiers, both gated on C3 containing a MUV pattern):
         #
-        # Known MUV clinical partners (teaching hospitals):
-        #   - Univ Hosp St Marina / Sveta Marina Varna
-        #   - University Hospital Varna
-        # We match these by checking for "marina" or "univ hosp" + "varna".
+        # Tier 1 — No C1 MUV match at all for this record:
+        #   All C1 authors belong to MUV (C3 is the authority).
+        #   Add every C1-block author that hasn't been captured yet.
+        #
+        # Tier 2 — Some C1 authors already matched, some in partner hospitals:
+        #   Only add authors whose C1 block is a known MUV clinical partner
+        #   (St Marina, Sveta Marina, Univ Hosp Varna) and not yet captured.
         MUV_PARTNER_PATTERNS = [
             "st marina",
             "sveta marina",
             "marina varna",
             "univ hosp varna",
             "university hospital varna",
+            "st anna",          # St. Anna Hospital Varna (another MUV partner)
         ]
 
         c3 = rec.get("C3", "")
@@ -292,21 +295,30 @@ def extract_muv_author_pairs(wos_records: List[Dict], cfg: dict) -> List[Dict]:
             c3_norm = normalize_name(c3)
             if _is_muv_affiliation(c3_norm, patterns):
                 blocks_all = re.findall(r'\[(.*?)\]\s*([^\[]+)', c1)
+                # Check whether ANY block already matched as MUV
+                any_muv_in_c1 = any(
+                    _is_muv_affiliation(normalize_name(aff), patterns)
+                    for _, aff in blocks_all
+                )
                 for authors_str, affil_str in blocks_all:
                     affil_norm = normalize_name(affil_str)
-                    # Skip blocks already matched as MUV
                     if _is_muv_affiliation(affil_norm, patterns):
-                        continue
-                    # Check if this block is a MUV clinical partner
-                    if any(pat in affil_norm for pat in MUV_PARTNER_PATTERNS):
+                        continue  # already handled in primary pass
+                    is_partner = any(pat in affil_norm for pat in MUV_PARTNER_PATTERNS)
+                    # Tier 1: no MUV block in C1 at all — add authors whose C1
+                    # affiliation contains "varna" in the address portion.
+                    # This excludes co-authors from other cities/countries.
+                    # Tier 2: known partner hospital (already checked above).
+                    is_varna_address = "varna" in affil_norm
+                    if (not any_muv_in_c1 and is_varna_address) or is_partner:
                         authors = [a.strip() for a in authors_str.split(';') if a.strip()]
-                        partner_label = affil_str.strip() + " [MUV partner via C3]"
+                        fallback_label = affil_str.strip() + " [via C3]"
                         for auth in authors:
                             key = (auth, ut)
                             if key not in merged:
                                 merged[key] = []
-                            if partner_label not in merged[key]:
-                                merged[key].append(partner_label)
+                            if fallback_label not in merged[key]:
+                                merged[key].append(fallback_label)
 
     extracted = []
     for (auth, ut), muv_affils in merged.items():

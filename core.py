@@ -230,13 +230,14 @@ def extract_muv_author_pairs(wos_records: List[Dict], cfg: dict) -> List[Dict]:
 
     Key behaviours
     --------------
-    * An author who appears in N different MUV C1 blocks (e.g. listed under
-      both "Dept Physiol" and "Vasc Biol Res Grp") produces exactly ONE row
-      with all MUV affiliation strings merged into muv_affils — avoiding the
-      duplicate-row / inflated-count bug.
-    * Matching uses the configured patterns PLUS hard-coded fallbacks for the
-      official full institution name and reversed word-order forms that WoS
-      sometimes exports.
+    * An author who appears in N different MUV C1 blocks produces exactly ONE row
+      with all MUV affiliation strings merged into muv_affils.
+    * Matching uses the configured patterns PLUS hard-coded fallbacks.
+    * C3 fallback: WoS sometimes lists a hospital/clinic in C1 but correctly
+      disambiguates to "Medical University Varna" in C3.  When the whole record's
+      C3 field matches MUV but an author has no matching C1 block, all AF-field
+      authors are credited with the C3 affiliation string so they are not silently
+      dropped (e.g. "Univ Hosp St Marina Varna" in C1, MUV in C3).
     """
     patterns = [p.lower() for p in cfg.get("muv_affiliation_patterns", []) if p.strip()]
 
@@ -246,22 +247,66 @@ def extract_muv_author_pairs(wos_records: List[Dict], cfg: dict) -> List[Dict]:
     for rec in wos_records:
         ut = (rec.get("UT") or "").strip()
         c1 = rec.get("C1", "")
-        if not c1 or not ut:
+        if not ut:
             continue
 
-        blocks = re.findall(r'\[(.*?)\]\s*([^\[]+)', c1)
-        for authors_str, affil_str in blocks:
-            affil_norm = normalize_name(affil_str)
-            if not _is_muv_affiliation(affil_norm, patterns):
-                continue
-            authors = [a.strip() for a in authors_str.split(';') if a.strip()]
-            affil_clean = affil_str.strip()
-            for auth in authors:
-                key = (auth, ut)
-                if key not in merged:
-                    merged[key] = []
-                if affil_clean not in merged[key]:
-                    merged[key].append(affil_clean)
+        # ── Primary pass: C1 bracketed blocks ────────────────────────────────
+        if c1:
+            blocks = re.findall(r'\[(.*?)\]\s*([^\[]+)', c1)
+            for authors_str, affil_str in blocks:
+                affil_norm = normalize_name(affil_str)
+                if not _is_muv_affiliation(affil_norm, patterns):
+                    continue
+                authors = [a.strip() for a in authors_str.split(';') if a.strip()]
+                affil_clean = affil_str.strip()
+                for auth in authors:
+                    key = (auth, ut)
+                    if key not in merged:
+                        merged[key] = []
+                    if affil_clean not in merged[key]:
+                        merged[key].append(affil_clean)
+
+        # ── C3 fallback: record-level MUV disambiguation ──────────────────────
+        # WoS C3 lists disambiguated institution names for the whole record.
+        # When C3 contains MUV but an author's C1 block shows only a clinical
+        # partner hospital (e.g. "Univ Hosp St Marina Varna"), that author is
+        # silently dropped by the primary C1 pass.
+        #
+        # Fix: if C3 has MUV, scan C1 blocks whose affiliation is NOT MUV but
+        # IS a known MUV clinical partner.  Credit those authors as MUV.
+        #
+        # Known MUV clinical partners (teaching hospitals):
+        #   - Univ Hosp St Marina / Sveta Marina Varna
+        #   - University Hospital Varna
+        # We match these by checking for "marina" or "univ hosp" + "varna".
+        MUV_PARTNER_PATTERNS = [
+            "st marina",
+            "sveta marina",
+            "marina varna",
+            "univ hosp varna",
+            "university hospital varna",
+        ]
+
+        c3 = rec.get("C3", "")
+        if c3 and c1:
+            c3_norm = normalize_name(c3)
+            if _is_muv_affiliation(c3_norm, patterns):
+                blocks_all = re.findall(r'\[(.*?)\]\s*([^\[]+)', c1)
+                for authors_str, affil_str in blocks_all:
+                    affil_norm = normalize_name(affil_str)
+                    # Skip blocks already matched as MUV
+                    if _is_muv_affiliation(affil_norm, patterns):
+                        continue
+                    # Check if this block is a MUV clinical partner
+                    if any(pat in affil_norm for pat in MUV_PARTNER_PATTERNS):
+                        authors = [a.strip() for a in authors_str.split(';') if a.strip()]
+                        partner_label = affil_str.strip() + " [MUV partner via C3]"
+                        for auth in authors:
+                            key = (auth, ut)
+                            if key not in merged:
+                                merged[key] = []
+                            if partner_label not in merged[key]:
+                                merged[key].append(partner_label)
 
     extracted = []
     for (auth, ut), muv_affils in merged.items():

@@ -1,23 +1,18 @@
 """
 app.py — WoS MyOrg Affiliation Tool v2
-UT-centric review: one publication at a time, all its MUV authors resolved
-before locking and moving to the next.
+UT-centric review with inline API upload after each publication is confirmed.
 Medical University of Varna · Research Information Systems
 """
 
 from __future__ import annotations
 
-import csv
-import io
 import re
-from collections import defaultdict
 from datetime import datetime
-from typing import Any
 
 import pandas as pd
 import streamlit as st
 
-from myorg_api import MyOrgClient, ApiResult
+from myorg_api import MyOrgClient
 from core import (
     load_config,
     build_person_index,
@@ -25,174 +20,86 @@ from core import (
     parse_wos_csv,
     extract_muv_author_pairs,
     batch_process,
-    build_upload_csv,
-    build_audit_json,
     normalize_name,
     name_similarity,
 )
 
-# ── Page config ───────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="WoS → MyOrg  v2",
-    page_icon="🔬",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
+st.set_page_config(page_title="WoS → MyOrg  v2", page_icon="🔬",
+                   layout="wide", initial_sidebar_state="expanded")
 
-# ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
-
-html, body, [class*="css"] { font-family: 'IBM Plex Sans', sans-serif; }
-
-/* ── Header ── */
-.app-header {
-    background: #0f1923;
-    color: #e8f4f8;
-    padding: 1.4rem 2rem 1.2rem;
-    border-bottom: 3px solid #1a9dc8;
-    margin: -1rem -1rem 1.5rem;
-    display: flex; align-items: baseline; gap: 1rem;
-}
-.app-header h1 { font-size: 1.4rem; font-weight: 600; margin: 0; letter-spacing: .02em; color: #fff; }
-.app-header .sub { font-family: 'IBM Plex Mono', monospace; font-size: .75rem; color: #7ec8e3; }
-
-/* ── UT card ── */
-.ut-card {
-    background: #0f1923;
-    border: 1px solid #1a4a6b;
-    border-left: 4px solid #1a9dc8;
-    border-radius: 6px;
-    padding: 1rem 1.4rem;
-    margin-bottom: 1.2rem;
-    font-family: 'IBM Plex Mono', monospace;
-}
-.ut-card .ut-id   { font-size: 1.05rem; font-weight: 600; color: #7ec8e3; letter-spacing:.03em; }
-.ut-card .ut-meta { font-size: .78rem; color: #8aabb8; margin-top: .3rem; }
-
-/* ── Author row ── */
-.author-row {
-    border: 1px solid #e0e8ef;
-    border-radius: 6px;
-    padding: .85rem 1rem;
-    margin-bottom: .7rem;
-    background: #fafcfe;
-}
-.author-row.locked   { background: #f0faf4; border-color: #27ae60; }
-.author-row.skipped  { background: #f8f8f8; border-color: #bbb; opacity: .7; }
-.author-row.rejected { background: #fff5f5; border-color: #e74c3c; }
-
-/* ── Badge ── */
-.badge {
-    display: inline-block; padding: .15rem .55rem; border-radius: 3px;
-    font-size: .72rem; font-weight: 600; letter-spacing: .04em;
-    font-family: 'IBM Plex Mono', monospace; margin-right: .4rem;
-}
-.badge-exact    { background:#d4edda; color:#155724; }
-.badge-initial  { background:#fff3cd; color:#856404; }
-.badge-fuzzy    { background:#d1ecf1; color:#0c5460; }
-.badge-new      { background:#e8d5f5; color:#5a1f8a; }
-.badge-skip     { background:#e2e3e5; color:#383d41; }
-.badge-dup      { background:#f8d7da; color:#721c24; }
-
-/* ── Progress bar ── */
-.prog-bar-wrap { background:#e0e8ef; border-radius:4px; height:8px; margin:.5rem 0 1rem; }
-.prog-bar-fill { background: linear-gradient(90deg,#1a9dc8,#27ae60); border-radius:4px; height:8px; transition: width .3s; }
-
-/* ── Nav buttons ── */
-.stButton>button {
-    font-family: 'IBM Plex Sans', sans-serif;
-    font-weight: 500; border-radius: 4px;
-}
-
-/* ── Section heading ── */
-.sec-head {
-    font-size: .7rem; font-weight: 600; letter-spacing: .1em;
-    color: #1a9dc8; text-transform: uppercase; margin: 1.2rem 0 .5rem;
-    border-bottom: 1px solid #d0e8f0; padding-bottom: .3rem;
-}
-
-/* ── Affil chip ── */
-.chip {
-    display:inline-block; background:#e8f4f8; color:#0c5460;
-    border-radius:3px; padding:.1rem .45rem; font-size:.72rem;
-    margin:.1rem; font-family:'IBM Plex Mono',monospace;
-    border:1px solid #b8dde8;
-}
-
-/* ── Locked UT indicator ── */
-.locked-ut {
-    display:inline-flex; align-items:center; gap:.5rem;
-    background:#f0faf4; border:1px solid #27ae60; border-radius:4px;
-    padding:.35rem .8rem; font-size:.82rem; color:#155724;
-    font-weight:500; margin-bottom:.5rem;
-}
-
-/* ── Metric grid ── */
-.metric-grid { display:flex; gap:.8rem; flex-wrap:wrap; margin:.8rem 0 1.2rem; }
-.metric-card {
-    background:#fff; border:1px solid #d0e8f0; border-radius:6px;
-    padding:.7rem 1.1rem; min-width:110px; text-align:center;
-}
-.metric-card .num { font-size:1.6rem; font-weight:700; font-family:'IBM Plex Mono',monospace; color:#0f1923; }
-.metric-card .num-blue  { color:#1a9dc8; }
-.metric-card .num-green { color:#27ae60; }
-.metric-card .num-amber { color:#e67e22; }
-.metric-card .num-red   { color:#e74c3c; }
-.metric-card .lbl { font-size:.68rem; color:#7a8fa0; text-transform:uppercase; letter-spacing:.06em; margin-top:.15rem; }
+html,body,[class*="css"]{font-family:'IBM Plex Sans',sans-serif;}
+.app-header{background:#0f1923;color:#e8f4f8;padding:1.4rem 2rem 1.2rem;border-bottom:3px solid #1a9dc8;margin:-1rem -1rem 1.5rem;display:flex;align-items:baseline;gap:1rem;}
+.app-header h1{font-size:1.4rem;font-weight:600;margin:0;color:#fff;}
+.app-header .sub{font-family:'IBM Plex Mono',monospace;font-size:.75rem;color:#7ec8e3;}
+.ut-card{background:#0f1923;border:1px solid #1a4a6b;border-left:4px solid #1a9dc8;border-radius:6px;padding:1rem 1.4rem;margin-bottom:1.2rem;font-family:'IBM Plex Mono',monospace;}
+.ut-card .ut-id{font-size:1.05rem;font-weight:600;color:#7ec8e3;}
+.ut-card .ut-meta{font-size:.78rem;color:#8aabb8;margin-top:.3rem;}
+.author-row{border:1px solid #e0e8ef;border-radius:6px;padding:.85rem 1rem;margin-bottom:.7rem;background:#fafcfe;}
+.author-row.locked{background:#f0faf4;border-color:#27ae60;}
+.author-row.rejected{background:#fff5f5;border-color:#e74c3c;}
+.badge{display:inline-block;padding:.15rem .55rem;border-radius:3px;font-size:.72rem;font-weight:600;letter-spacing:.04em;font-family:'IBM Plex Mono',monospace;margin-right:.4rem;}
+.badge-exact{background:#d4edda;color:#155724;}.badge-initial{background:#fff3cd;color:#856404;}
+.badge-fuzzy{background:#d1ecf1;color:#0c5460;}.badge-new{background:#e8d5f5;color:#5a1f8a;}
+.badge-skip{background:#e2e3e5;color:#383d41;}.badge-dup{background:#f8d7da;color:#721c24;}
+.prog-bar-wrap{background:#e0e8ef;border-radius:4px;height:8px;margin:.5rem 0 1rem;}
+.prog-bar-fill{background:linear-gradient(90deg,#1a9dc8,#27ae60);border-radius:4px;height:8px;transition:width .3s;}
+.sec-head{font-size:.7rem;font-weight:600;letter-spacing:.1em;color:#1a9dc8;text-transform:uppercase;margin:1.2rem 0 .5rem;border-bottom:1px solid #d0e8f0;padding-bottom:.3rem;}
+.chip{display:inline-block;background:#e8f4f8;color:#0c5460;border-radius:3px;padding:.1rem .45rem;font-size:.72rem;margin:.1rem;font-family:'IBM Plex Mono',monospace;border:1px solid #b8dde8;}
+.locked-ut{display:inline-flex;align-items:center;gap:.5rem;background:#f0faf4;border:1px solid #27ae60;border-radius:4px;padding:.35rem .8rem;font-size:.82rem;color:#155724;font-weight:500;margin-bottom:.5rem;}
+.metric-grid{display:flex;gap:.8rem;flex-wrap:wrap;margin:.8rem 0 1.2rem;}
+.metric-card{background:#fff;border:1px solid #d0e8f0;border-radius:6px;padding:.7rem 1.1rem;min-width:110px;text-align:center;}
+.metric-card .num{font-size:1.6rem;font-weight:700;font-family:'IBM Plex Mono',monospace;color:#0f1923;}
+.metric-card .num-blue{color:#1a9dc8;}.metric-card .num-green{color:#27ae60;}
+.metric-card .num-amber{color:#e67e22;}.metric-card .num-red{color:#e74c3c;}
+.metric-card .lbl{font-size:.68rem;color:#7a8fa0;text-transform:uppercase;letter-spacing:.06em;margin-top:.15rem;}
+.upl-table{width:100%;border-collapse:collapse;font-family:'IBM Plex Mono',monospace;font-size:.78rem;margin:.6rem 0 1rem;}
+.upl-table th{background:#0f1923;color:#7ec8e3;padding:.45rem .7rem;text-align:left;font-weight:600;letter-spacing:.05em;}
+.upl-table td{padding:.4rem .7rem;border-bottom:1px solid #e8f0f5;color:#2c3e50;}
+.upl-table tr:hover td{background:#f5fafe;}
+.upl-table .new-badge{color:#9b59b6;font-size:.7rem;font-weight:700;margin-left:.3rem;}
+.upl-result{display:flex;align-items:center;gap:.6rem;padding:.35rem .7rem;border-radius:4px;margin:.15rem 0;font-size:.77rem;font-family:'IBM Plex Mono',monospace;}
+.upl-result.ok{background:#f0faf4;}.upl-result.skip{background:#f5f5f5;color:#888;}.upl-result.error{background:#fff5f5;}
+.r-pid{color:#1a9dc8;min-width:4rem;}.r-name{min-width:14rem;}.r-msg{color:#666;}
+.api-bar{padding:.5rem 1rem;border-radius:5px;font-size:.8rem;margin-bottom:.8rem;display:flex;align-items:center;gap:.6rem;}
+.api-ok{background:#f0faf4;border:1px solid #27ae60;color:#155724;}
+.api-dry{background:#fff8e8;border:1px solid #e67e22;color:#8a5200;}
+.api-off{background:#f8f8f8;border:1px solid #ccc;color:#666;}
 </style>
 """, unsafe_allow_html=True)
 
-# ── Header ────────────────────────────────────────────────────────────────────
-st.markdown("""
-<div class="app-header">
-  <h1>🔬 WoS → MyOrg</h1>
-  <span class="sub">v2 · UT-centric review · Medical University of Varna</span>
-</div>
-""", unsafe_allow_html=True)
+st.markdown('<div class="app-header"><h1>🔬 WoS → MyOrg</h1>'
+            '<span class="sub">v2 · UT-centric review + inline upload · Medical University of Varna</span>'
+            '</div>', unsafe_allow_html=True)
 
-# ── Session state defaults ────────────────────────────────────────────────────
-def _init():
-    defaults = {
-        "processed":       False,
-        "ut_order":        [],       # ordered list of UT strings to review
-        "ut_index":        0,        # current UT cursor
-        "ut_locked":       {},       # ut → True when confirmed
-        "author_decs":     {},       # (norm, ut) → decision dict
-        "output_rows":     [],
-        "rejected_rows":   [],
-        "finalized":       False,
-        "batch_result":    None,
-        "person_index":    [],
-        "existing_pairs":  set(),
-        "orgs":            [],
-        "cfg":             {},
-        "source_file":     "",
-        "upload_log":      [],   # list of per-row upload result dicts
-        "upload_done":     False,
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
-_init()
+# ── Session state ─────────────────────────────────────────────────────────────
+for k, v in {
+    "processed": False, "ut_order": [], "ut_index": 0,
+    "ut_locked": {}, "author_decs": {}, "batch_result": None,
+    "person_index": [], "existing_pairs": set(), "orgs": [], "cfg": {},
+    "source_file": "", "max_pid": 0,
+    "ut_rows_cache": {}, "ut_upload_done": {}, "upload_log": {},
+    "global_api_key": "", "global_dry_run": True,
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _safe_key(*parts: str) -> str:
-    raw = "_".join(str(p) for p in parts)
+# ── Pure helpers ──────────────────────────────────────────────────────────────
+def _safe_key(*parts):
+    raw  = "_".join(str(p) for p in parts)
     safe = re.sub(r"[^a-z0-9]", "_", raw.lower())
     return re.sub(r"_+", "_", safe).strip("_")
 
-def search_persons(query: str, person_index: list, max_results: int = 8) -> list:
+def search_persons(query, person_index, max_results=8):
     if not query or len(query) < 2:
         return []
-    q = normalize_name(query)
+    q       = normalize_name(query)
     q_parts = q.split()
     results = []
     for p in person_index:
-        name = p["NormName"]
+        name  = p["NormName"]
         score = name_similarity(q, name)
         if any(part in name for part in q_parts if len(part) > 2):
             score = max(score, 0.45)
@@ -201,270 +108,386 @@ def search_persons(query: str, person_index: list, max_results: int = 8) -> list
     results.sort(key=lambda x: -x[0])
     return results[:max_results]
 
-def org_label(oid: str, org_map: dict) -> str:
+def org_label(oid, org_map):
     for lbl, v in org_map.items():
         if v == oid:
             return lbl
     return oid
 
-def build_org_map(orgs: list) -> tuple[dict, list]:
+def build_org_map(orgs):
     m = {f"[{o['OrganizationID']}] {o['OrganizationName']}": o["OrganizationID"] for o in orgs}
-    labels = ["— none / skip —"] + list(m.keys())
-    return m, labels
+    return m, ["— none / skip —"] + list(m.keys())
 
-def _ut_status(ut: str) -> str:
-    """Return 'locked', 'skip' (all dupes), or 'pending'."""
+def _split_name(full_name):
+    if "," in full_name:
+        last, _, first = full_name.partition(",")
+        return first.strip(), last.strip()
+    return "", full_name.strip()
+
+def _ut_status(ut):
     if st.session_state.ut_locked.get(ut):
         return "locked"
-    result = st.session_state.batch_result
-    if result is None:
+    res = st.session_state.batch_result
+    if res is None:
         return "pending"
-    # Check if all pairs for this UT are already_uploaded
-    au = [r for r in result["already_uploaded"] if r.get("UT") == ut]
-    nr = [r for r in result["needs_review"]     if r.get("UT") == ut]
-    cf = [r for r in result["confirmed"]         if r.get("UT") == ut]
-    if not nr and not cf:
-        return "skip"
-    return "pending"
+    nr = [r for r in res["needs_review"] if r.get("UT") == ut]
+    cf = [r for r in res["confirmed"]    if r.get("UT") == ut]
+    return "skip" if not nr and not cf else "pending"
 
-def _ut_needs_attention(ut: str) -> list:
-    """Rows for this UT that need user input (needs_review only)."""
-    if st.session_state.batch_result is None:
-        return []
-    return [r for r in st.session_state.batch_result["needs_review"] if r.get("UT") == ut]
+def _ut_needs_attention(ut):
+    res = st.session_state.batch_result
+    return [] if res is None else [r for r in res["needs_review"] if r.get("UT") == ut]
 
-def _ut_auto_confirmed(ut: str) -> list:
-    if st.session_state.batch_result is None:
-        return []
-    return [r for r in st.session_state.batch_result["confirmed"] if r.get("UT") == ut]
+def _ut_auto_confirmed(ut):
+    res = st.session_state.batch_result
+    return [] if res is None else [r for r in res["confirmed"] if r.get("UT") == ut]
 
-def _ut_already_uploaded(ut: str) -> list:
-    if st.session_state.batch_result is None:
-        return []
-    return [r for r in st.session_state.batch_result["already_uploaded"] if r.get("UT") == ut]
+def _ut_already_uploaded(ut):
+    res = st.session_state.batch_result
+    return [] if res is None else [r for r in res["already_uploaded"] if r.get("UT") == ut]
 
-def _all_authors_decided(ut: str) -> bool:
-    """True when every needs_review row for this UT has a decision."""
-    rows = _ut_needs_attention(ut)
-    for r in rows:
-        key = (normalize_name(r["AuthorFullName"]), ut)
-        dec = st.session_state.author_decs.get(key)
-        if dec is None or not dec.get("decided", False):
+def _all_authors_decided(ut):
+    for r in _ut_needs_attention(ut):
+        dec = st.session_state.author_decs.get((normalize_name(r["AuthorFullName"]), ut))
+        if not dec or not dec.get("decided"):
             return False
     return True
 
-def _get_dec(norm: str, ut: str) -> dict:
+def _get_dec(norm, ut):
     return st.session_state.author_decs.get((norm, ut), {})
 
-def _set_dec(norm: str, ut: str, dec: dict):
+def _set_dec(norm, ut, dec):
     st.session_state.author_decs[(norm, ut)] = dec
+
+def _ut_is_done(ut):
+    if st.session_state.ut_locked.get(ut): return True
+    if _ut_status(ut) == "skip":           return True
+    if not _ut_needs_attention(ut):        return True
+    return False
+
+def _build_ut_rows(ut):
+    """Build & cache upload-ready rows for one UT."""
+    res = st.session_state.batch_result
+    ep  = st.session_state.existing_pairs
+    seen, output = set(), []
+
+    for r in res["confirmed"]:
+        if r.get("UT") != ut: continue
+        pid, oid = r["PersonID"], r.get("OrganizationID", "")
+        k = (pid, ut, oid)
+        if k in seen: continue
+        seen.add(k)
+        first, last = _split_name(r.get("AuthorFullName", ""))
+        output.append({"PersonID": pid, "FirstName": first, "LastName": last,
+                       "OrganizationID": oid, "DocumentID": ut,
+                       "AuthorFullName": r.get("AuthorFullName", ""),
+                       "match_type": "exact", "is_new": False})
+
+    for r in res["needs_review"]:
+        if r.get("UT") != ut: continue
+        raw   = r.get("AuthorFullName", r.get("author_full", ""))
+        norm  = normalize_name(raw)
+        dec   = st.session_state.author_decs.get((norm, ut))
+        if not dec or dec.get("action") == "reject" or not dec.get("decided"): continue
+
+        pid  = str(dec.get("resolved_pid", "")).strip()
+        name = dec.get("resolved_name", raw)
+        oids = [o for o in dec.get("org_ids", [""]) if o] or [""]
+
+        if pid and (pid, ut) in ep: continue   # already in MyOrg
+
+        is_new = dec.get("match_type") == "new"
+        first, last = _split_name(name)
+        for oid in oids:
+            k = (pid, ut, oid)
+            if k in seen: continue
+            seen.add(k)
+            output.append({"PersonID": pid, "FirstName": first, "LastName": last,
+                           "OrganizationID": oid, "DocumentID": ut,
+                           "AuthorFullName": name, "match_type": dec.get("match_type", ""),
+                           "is_new": is_new})
+
+    st.session_state.ut_rows_cache[ut] = output
+    return output
+
+
+def _show_ut_upload_section(ut):
+    """Render upload table + upload button for a locked UT."""
+    rows     = st.session_state.ut_rows_cache.get(ut) or _build_ut_rows(ut)
+    api_key  = st.session_state.global_api_key
+    dry_run  = st.session_state.global_dry_run
+    uploaded = st.session_state.ut_upload_done.get(ut, False)
+    log      = st.session_state.upload_log.get(ut, [])
+
+    st.markdown('<div class="sec-head">Upload records</div>', unsafe_allow_html=True)
+
+    if not rows:
+        st.info("No records to upload — all authors excluded or already in MyOrg.")
+        return
+
+    # Table
+    rows_html = "".join(
+        f"<tr>"
+        f"<td>{r['PersonID']}"
+        f"{'<span class=\"new-badge\">NEW</span>' if r['is_new'] else ''}</td>"
+        f"<td>{r['FirstName']}</td><td>{r['LastName']}</td>"
+        f"<td>{r['OrganizationID']}</td><td>{r['DocumentID']}</td>"
+        f"</tr>"
+        for r in rows
+    )
+    st.markdown(f"""
+<table class="upl-table">
+<thead><tr><th>PersonID</th><th>FirstName</th><th>LastName</th>
+<th>OrganizationID</th><th>DocumentID</th></tr></thead>
+<tbody>{rows_html}</tbody>
+</table>""", unsafe_allow_html=True)
+
+    if not uploaded:
+        if not api_key and not dry_run:
+            st.warning("⚠️ Add your API key in the sidebar.")
+            return
+        lbl = f"🔬 Simulate upload ({len(rows)} rows)" if dry_run \
+              else f"🚀 Upload {len(rows)} row(s) to MyOrg"
+        if st.button(lbl, key=f"upload_ut_{_safe_key(ut)}", type="primary"):
+            client  = MyOrgClient(api_key or "test", dry_run=dry_run)
+            ut_log  = []
+            prog    = st.progress(0)
+            for i, row in enumerate(rows):
+                res = client.upload_row(
+                    row={"PersonID": row["PersonID"], "AuthorFullName": row["AuthorFullName"],
+                         "UT": row["DocumentID"], "OrganizationID": row["OrganizationID"],
+                         "match_type": row["match_type"]},
+                    is_new_person=row["is_new"],
+                    first_name=row["FirstName"], last_name=row["LastName"], delay=0.25,
+                )
+                ut_log.append({
+                    "pid": row["PersonID"], "name": row["AuthorFullName"],
+                    "oid": row["OrganizationID"], "ut": row["DocumentID"],
+                    "is_new": row["is_new"], "overall": res["overall"],
+                    "p_msg":   res["person_step"].message if res["person_step"] else "",
+                    "pub_msg": res["pub_step"].message    if res["pub_step"]    else "",
+                })
+                prog.progress((i + 1) / len(rows))
+            st.session_state.upload_log[ut]     = ut_log
+            st.session_state.ut_upload_done[ut] = True
+            # Auto-advance to next unlocked, not-yet-uploaded UT
+            ut_order = st.session_state.ut_order
+            cur_idx  = st.session_state.ut_index
+            for i in range(cur_idx + 1, len(ut_order)):
+                nxt = ut_order[i]
+                if not st.session_state.ut_locked.get(nxt):
+                    st.session_state.ut_index = i
+                    break
+            st.rerun()
+    else:
+        # Show results
+        n_ok   = sum(1 for e in log if e["overall"] == "ok")
+        n_skip = sum(1 for e in log if e["overall"] == "skipped")
+        n_err  = sum(1 for e in log if e["overall"] == "error")
+        mode   = "🔬 Simulated" if dry_run else "✅ Uploaded"
+        st.markdown(
+            f'<div style="font-size:.82rem;margin:.4rem 0 .6rem;">'
+            f'<b>{mode}</b> &nbsp; '
+            f'<span style="color:#27ae60;font-weight:600;">✓ {n_ok} ok</span> &nbsp; '
+            f'<span style="color:#888;">⏭ {n_skip} skipped</span> &nbsp; '
+            f'<span style="color:#e74c3c;">✗ {n_err} errors</span></div>',
+            unsafe_allow_html=True,
+        )
+        for e in log:
+            icon = {"ok":"✅","skipped":"⏭","error":"❌"}.get(e["overall"],"⏳")
+            nb   = " <b style='color:#9b59b6;font-size:.7rem;'>NEW</b>" if e["is_new"] else ""
+            msg  = (e.get("pub_msg") or e.get("p_msg") or "")[:100]
+            st.markdown(
+                f'<div class="upl-result {e["overall"]}">'
+                f'<span>{icon}</span>'
+                f'<span class="r-pid">{e["pid"]}</span>'
+                f'<span class="r-name">{e["name"]}{nb}</span>'
+                f'<span class="r-msg">{msg}</span></div>',
+                unsafe_allow_html=True,
+            )
+        if n_err:
+            st.error(f"{n_err} error(s) — see Tab 3 for details.")
+        if st.button("🔄 Re-upload", key=f"reupload_{_safe_key(ut)}"):
+            st.session_state.ut_upload_done.pop(ut, None)
+            st.session_state.upload_log.pop(ut, None)
+            st.rerun()
+
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("### ⚙️ API Settings")
+    key_in = st.text_input("Clarivate API Key", type="password",
+                           value=st.session_state.global_api_key,
+                           placeholder="Paste X-ApiKey here…",
+                           key="sidebar_api_key")
+    if key_in != st.session_state.global_api_key:
+        st.session_state.global_api_key = key_in
+
+    dr = st.checkbox("🔬 Dry run (no real calls)",
+                     value=st.session_state.global_dry_run, key="sidebar_dry_run")
+    if dr != st.session_state.global_dry_run:
+        st.session_state.global_dry_run = dr
+
+    ak, dry = st.session_state.global_api_key, st.session_state.global_dry_run
+    if dry:
+        st.markdown('<div class="api-bar api-dry">🔬 Dry run — simulated calls only</div>',
+                    unsafe_allow_html=True)
+    elif ak:
+        st.markdown('<div class="api-bar api-ok">🟢 Live — real API calls</div>',
+                    unsafe_allow_html=True)
+        if st.button("🔌 Test connection", key="sb_test"):
+            with st.spinner("Testing…"):
+                r = MyOrgClient(ak).test_connection()
+            (st.success if r.success else st.error)(r.message)
+    else:
+        st.markdown('<div class="api-bar api-off">⚪ No key — enable dry run or add key</div>',
+                    unsafe_allow_html=True)
+
+    st.markdown("---")
+    if st.session_state.processed:
+        st.markdown("### Publications")
+        for i, u in enumerate(st.session_state.ut_order):
+            up = st.session_state.ut_upload_done.get(u)
+            dn = _ut_is_done(u)
+            icon = "🚀" if up else ("✅" if dn else ("⏳" if _ut_needs_attention(u) else "—"))
+            if st.button(f"{icon} {u}", key=f"sb_{i}", use_container_width=True):
+                st.session_state.ut_index = i
+                st.rerun()
 
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_load, tab_review, tab_export, tab_upload = st.tabs([
+tab_load, tab_review, tab_log = st.tabs([
     "📂 1 · Load Files",
-    "🔍 2 · Review by Publication",
-    "⬇️ 3 · Export",
-    "🚀 4 · Upload to MyOrg API",
+    "🔍 2 · Review & Upload",
+    "📋 3 · Upload Log",
 ])
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — LOAD
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_load:
     st.markdown('<div class="sec-head">Upload files</div>', unsafe_allow_html=True)
-
     c1, c2, c3 = st.columns(3)
-    with c1:
-        wos_file = st.file_uploader("WoS Export CSV", type=["csv","txt"], key="wos_up",
-            help="Web of Science full-record export. Must contain AU, AF, C1, C3, UT fields.")
-    with c2:
-        res_file = st.file_uploader("ResearcherAndDocument.csv", type=["csv"], key="res_up",
-            help="Current MyOrg researcher roster.")
-    with c3:
-        org_file = st.file_uploader("OrganizationHierarchy.csv", type=["csv"], key="org_up",
-            help="Organisation hierarchy for affiliation picker.")
+    with c1: wos_file = st.file_uploader("WoS Export CSV", type=["csv","txt"], key="wos_up")
+    with c2: res_file = st.file_uploader("ResearcherAndDocument.csv", type=["csv"], key="res_up")
+    with c3: org_file = st.file_uploader("OrganizationHierarchy.csv", type=["csv"], key="org_up")
 
     if wos_file and res_file and org_file:
-        with st.expander("Preview uploads", expanded=False):
-            p1, p2 = st.columns(2)
-            with p1:
-                st.caption("WoS (first 5 rows)")
-                st.dataframe(pd.read_csv(io.BytesIO(wos_file.read()), nrows=5,
-                             encoding="utf-8-sig"), use_container_width=True)
-                wos_file.seek(0)
-            with p2:
-                st.caption("ResearcherAndDocument (first 5 rows)")
-                st.dataframe(pd.read_csv(io.BytesIO(res_file.read()), nrows=5,
-                             encoding="utf-8-sig"), use_container_width=True)
-                res_file.seek(0)
-
         if st.button("⚙️  Process files", type="primary", use_container_width=True):
             with st.spinner("Parsing and matching…"):
-                wos_content = wos_file.read().decode("utf-8-sig")
-                res_content = res_file.read().decode("utf-8-sig")
-                org_content = org_file.read().decode("utf-8-sig")
-
-                cfg = load_config("config.json")
-                person_index, max_pid, existing_pairs = build_person_index(res_content)
-                orgs  = parse_org_hierarchy(org_content)
-                records   = parse_wos_csv(wos_content)
-                muv_pairs = extract_muv_author_pairs(records, cfg)
-
-                result = batch_process(
-                    muv_pairs, person_index, orgs, cfg,
-                    start_pid=max_pid + 1,
-                    researcher_csv_content=res_content,
-                    existing_pairs=existing_pairs,
-                )
-
-                # Build UT order: UTs with needs_review or confirmed first (need attention),
-                # then all-duplicate UTs last (auto-skipped)
-                all_uts_in_result = sorted({
-                    r.get("UT", "") for r in
-                    result["confirmed"] + result["needs_review"] + result["already_uploaded"]
-                    if r.get("UT")
-                })
-
-                def ut_sort_key(ut):
-                    has_review = any(r["UT"] == ut for r in result["needs_review"])
-                    has_conf   = any(r["UT"] == ut for r in result["confirmed"])
-                    return (0 if (has_review or has_conf) else 1, ut)
-
-                ut_order = sorted(all_uts_in_result, key=ut_sort_key)
-
+                wos_c = wos_file.read().decode("utf-8-sig")
+                res_c = res_file.read().decode("utf-8-sig")
+                org_c = org_file.read().decode("utf-8-sig")
+                cfg   = load_config("config.json")
+                pi, mpid, ep = build_person_index(res_c)
+                orgs  = parse_org_hierarchy(org_c)
+                recs  = parse_wos_csv(wos_c)
+                pairs = extract_muv_author_pairs(recs, cfg)
+                res   = batch_process(pairs, pi, orgs, cfg, mpid+1, res_c, ep)
+                all_uts = sorted({r.get("UT","") for r in
+                                  res["confirmed"]+res["needs_review"]+res["already_uploaded"]
+                                  if r.get("UT")})
+                ut_order = sorted(all_uts, key=lambda u: (
+                    0 if any(r["UT"]==u for r in res["needs_review"]+res["confirmed"]) else 1, u))
                 st.session_state.update({
-                    "processed":      True,
-                    "batch_result":   result,
-                    "person_index":   person_index,
-                    "existing_pairs": existing_pairs,
-                    "orgs":           orgs,
-                    "cfg":            cfg,
-                    "ut_order":       ut_order,
-                    "ut_index":       0,
-                    "ut_locked":      {},
-                    "author_decs":    {},
-                    "output_rows":    [],
-                    "rejected_rows":  [],
-                    "finalized":      False,
-                    "source_file":    wos_file.name,
-                    "max_pid":        max_pid,
+                    "processed": True, "batch_result": res, "person_index": pi,
+                    "existing_pairs": ep, "orgs": orgs, "cfg": cfg,
+                    "ut_order": ut_order, "ut_index": 0, "max_pid": mpid,
+                    "ut_locked": {}, "author_decs": {}, "source_file": wos_file.name,
+                    "ut_rows_cache": {}, "ut_upload_done": {}, "upload_log": {},
                 })
-            st.success(f"✅ Processed {len(records)} records · {len(muv_pairs)} MUV pairs · "
-                       f"{len(ut_order)} UTs to review.")
-            st.info("➡️ Go to **Tab 2** to review by publication.")
+            st.success(f"✅ {len(recs)} records · {len(pairs)} MUV pairs · {len(ut_order)} UTs")
+            st.info("➡️ Go to **Tab 2** to review and upload.")
     else:
         st.info("Upload all three files to begin.")
 
     if st.session_state.processed:
-        result = st.session_state.batch_result
-        au_all = result["already_uploaded"]
-        n_skip = len({r["UT"] for r in au_all
-                      if not any(r2["UT"] == r["UT"] for r2 in result["needs_review"] + result["confirmed"])})
-        n_dup_prob = len([r for r in au_all if r.get("match_type") == "probable_duplicate"])
-
-        st.markdown('<div class="sec-head">Processing summary</div>', unsafe_allow_html=True)
+        res   = st.session_state.batch_result
+        au_all = res["already_uploaded"]
+        st.markdown('<div class="sec-head">Summary</div>', unsafe_allow_html=True)
         st.markdown(f"""
 <div class="metric-grid">
-  <div class="metric-card"><div class="num num-blue">{len(st.session_state.ut_order)}</div><div class="lbl">UTs to review</div></div>
-  <div class="metric-card"><div class="num num-green">{len(result['confirmed'])}</div><div class="lbl">Auto-confirmed</div></div>
-  <div class="metric-card"><div class="num num-amber">{len(result['needs_review'])}</div><div class="lbl">Needs decision</div></div>
-  <div class="metric-card"><div class="num">{len(result['already_uploaded'])}</div><div class="lbl">Already in MyOrg</div></div>
-  <div class="metric-card"><div class="num num-red">{n_dup_prob}</div><div class="lbl">Prob. duplicates</div></div>
-  <div class="metric-card"><div class="num">{n_skip}</div><div class="lbl">All-dup UTs (auto-skip)</div></div>
-</div>
-""", unsafe_allow_html=True)
+  <div class="metric-card"><div class="num num-blue">{len(st.session_state.ut_order)}</div><div class="lbl">UTs</div></div>
+  <div class="metric-card"><div class="num num-green">{len(res['confirmed'])}</div><div class="lbl">Auto-confirmed</div></div>
+  <div class="metric-card"><div class="num num-amber">{len(res['needs_review'])}</div><div class="lbl">Needs decision</div></div>
+  <div class="metric-card"><div class="num">{len([r for r in au_all if r.get('match_type')!='probable_duplicate'])}</div><div class="lbl">Already in MyOrg</div></div>
+  <div class="metric-card"><div class="num num-red">{len([r for r in au_all if r.get('match_type')=='probable_duplicate'])}</div><div class="lbl">Prob. duplicates</div></div>
+</div>""", unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — UT-CENTRIC REVIEW
+# TAB 2 — REVIEW & UPLOAD
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_review:
     if not st.session_state.processed:
-        st.info("⬅️ Load and process files in Tab 1 first.")
+        st.info("⬅️ Load files in Tab 1 first.")
         st.stop()
 
-    result       = st.session_state.batch_result
+    res          = st.session_state.batch_result
     person_index = st.session_state.person_index
     orgs         = st.session_state.orgs
     cfg          = st.session_state.cfg
     ut_order     = st.session_state.ut_order
-    org_map, org_labels = build_org_map(orgs)
+    org_map, _   = build_org_map(orgs)
 
     if not ut_order:
         st.success("Nothing to review.")
         st.stop()
 
-    # ── Progress bar ─────────────────────────────────────────────────────────
-    def _ut_is_done(ut: str) -> bool:
-        """True when nothing more is needed for this UT."""
-        if st.session_state.ut_locked.get(ut):
-            return True
-        if _ut_status(ut) == "skip":
-            return True
-        # UTs with ONLY auto-confirmed rows (no needs_review) need no user action
-        if not _ut_needs_attention(ut):
-            return True
-        return False
-
-    n_done = sum(1 for ut in ut_order if _ut_is_done(ut))
-    n_need = sum(1 for ut in ut_order if _ut_needs_attention(ut))
-    pct = int(100 * n_done / len(ut_order)) if ut_order else 100
+    n_done = sum(1 for u in ut_order if _ut_is_done(u))
+    n_up   = sum(1 for u in ut_order if st.session_state.ut_upload_done.get(u))
+    n_need = sum(1 for u in ut_order if _ut_needs_attention(u))
+    pct    = int(100 * n_done / len(ut_order)) if ut_order else 100
 
     st.markdown(f"""
 <div style="display:flex;justify-content:space-between;font-size:.8rem;color:#5a7080;">
   <span>Progress</span>
-  <span><b>{n_done}</b> / {len(ut_order)} done &nbsp;·&nbsp; <b>{n_need}</b> need decisions</span>
+  <span><b>{n_done}</b>/{len(ut_order)} confirmed &nbsp;·&nbsp;
+        <b>{n_up}</b> uploaded &nbsp;·&nbsp;
+        <b>{n_need}</b> need decisions</span>
 </div>
 <div class="prog-bar-wrap"><div class="prog-bar-fill" style="width:{pct}%"></div></div>
 """, unsafe_allow_html=True)
 
-    # ── UT navigation ─────────────────────────────────────────────────────────
-    idx = st.session_state.ut_index
-    idx = max(0, min(idx, len(ut_order) - 1))
+    idx = max(0, min(st.session_state.ut_index, len(ut_order)-1))
 
     nav_l, nav_c, nav_r = st.columns([1, 4, 1])
     with nav_l:
-        if st.button("◀ Prev", use_container_width=True, disabled=(idx == 0)):
-            st.session_state.ut_index = max(0, idx - 1)
-            st.rerun()
+        if st.button("◀ Prev", use_container_width=True, disabled=(idx==0)):
+            st.session_state.ut_index = max(0, idx-1); st.rerun()
     with nav_r:
-        if st.button("Next ▶", use_container_width=True, disabled=(idx >= len(ut_order) - 1)):
-            st.session_state.ut_index = min(len(ut_order) - 1, idx + 1)
-            st.rerun()
+        if st.button("Next ▶", use_container_width=True, disabled=(idx>=len(ut_order)-1)):
+            st.session_state.ut_index = min(len(ut_order)-1, idx+1); st.rerun()
     with nav_c:
-        # Jump-to selectbox — NO persistent key so label changes don't
-        # cause mismatches when a UT is locked/unlocked mid-session.
-        ut_display = [
-            f"{'✅' if _ut_is_done(u) else '⏳'}  {u}"
-            for u in ut_order
-        ]
-        jump = st.selectbox(
-            "Jump to publication",
-            ut_display,
-            index=idx,
-            label_visibility="collapsed",
-        )
-        jumped_idx = ut_display.index(jump)
-        if jumped_idx != idx:
-            st.session_state.ut_index = jumped_idx
-            st.rerun()
+        def _icon(u):
+            if st.session_state.ut_upload_done.get(u): return "🚀"
+            if _ut_is_done(u): return "✅"
+            if _ut_needs_attention(u): return "⏳"
+            return "—"
+        ut_disp = [f"{_icon(u)}  {u}" for u in ut_order]
+        jump = st.selectbox("Jump", ut_disp, index=idx, label_visibility="collapsed")
+        ji = ut_disp.index(jump)
+        if ji != idx:
+            st.session_state.ut_index = ji; st.rerun()
 
     ut = ut_order[idx]
     status = _ut_status(ut)
 
-    # ── UT header card ────────────────────────────────────────────────────────
-    auto_rows  = _ut_auto_confirmed(ut)
-    rev_rows   = _ut_needs_attention(ut)
-    dup_rows   = _ut_already_uploaded(ut)
+    auto_rows = _ut_auto_confirmed(ut)
+    rev_rows  = _ut_needs_attention(ut)
+    dup_rows  = _ut_already_uploaded(ut)
 
-    _card_badge = ""
+    # UT header badge
+    _cb = ""
     if status == "locked":
-        _card_badge = "<span style='color:#27ae60;font-weight:600;margin-left:.8rem;'>✅ LOCKED</span>"
+        _cb = ("<span style='color:#1a9dc8;font-weight:600;margin-left:.8rem;'>🚀 UPLOADED</span>"
+               if st.session_state.ut_upload_done.get(ut) else
+               "<span style='color:#27ae60;font-weight:600;margin-left:.8rem;'>✅ LOCKED</span>")
     elif status == "skip":
-        _card_badge = "<span style='color:#888;margin-left:.8rem;'>⏭ all duplicates — auto-skipped</span>"
+        _cb = "<span style='color:#888;margin-left:.8rem;'>⏭ auto-skipped</span>"
     elif not rev_rows:
-        _card_badge = "<span style='color:#27ae60;margin-left:.8rem;'>✅ auto-done (no decisions needed)</span>"
+        _cb = "<span style='color:#27ae60;margin-left:.8rem;'>✅ auto-done</span>"
 
     st.markdown(f"""
 <div class="ut-card">
@@ -472,877 +495,266 @@ with tab_review:
   <div class="ut-meta">
     <b>{len(auto_rows)}</b> auto-confirmed &nbsp;·&nbsp;
     <b>{len(rev_rows)}</b> need decision &nbsp;·&nbsp;
-    <b>{len(dup_rows)}</b> already in MyOrg
-    {_card_badge}
+    <b>{len(dup_rows)}</b> already in MyOrg {_cb}
   </div>
-</div>
-""", unsafe_allow_html=True)
+</div>""", unsafe_allow_html=True)
 
-    # ── Already-uploaded rows (collapsed summary) ─────────────────────────────
     if dup_rows:
-        with st.expander(f"⏭  {len(dup_rows)} already in MyOrg (skipped)", expanded=False):
+        with st.expander(f"⏭  {len(dup_rows)} already in MyOrg", expanded=False):
             for r in dup_rows:
-                mt = r.get("match_type", "")
-                badge = "badge-dup" if mt == "probable_duplicate" else "badge-skip"
-                label = "PROB. DUP" if mt == "probable_duplicate" else "ALREADY IN"
-                score = f" ({r['match_score']:.2f})" if mt == "probable_duplicate" else ""
-                st.markdown(
-                    f'<span class="badge {badge}">{label}{score}</span> '
-                    f'<b>{r.get("author_full", r.get("AuthorFullName",""))}</b>'
-                    f' → {r.get("AuthorFullName","")} [{r.get("PersonID","")}]'
-                    f' <span style="font-size:.75rem;color:#888;">{r.get("Reason","")}</span>',
-                    unsafe_allow_html=True,
-                )
+                mt = r.get("match_type","")
+                bc = "badge-dup" if mt=="probable_duplicate" else "badge-skip"
+                bl = "PROB. DUP" if mt=="probable_duplicate" else "ALREADY IN"
+                sc = f" ({r['match_score']:.2f})" if mt=="probable_duplicate" else ""
+                st.markdown(f'<span class="badge {bc}">{bl}{sc}</span> '
+                            f'<b>{r.get("author_full",r.get("AuthorFullName",""))}</b>'
+                            f' → {r.get("AuthorFullName","")} [{r.get("PersonID","")}]',
+                            unsafe_allow_html=True)
 
-    # ── Auto-confirmed rows ───────────────────────────────────────────────────
     if auto_rows:
-        with st.expander(f"✅  {len(auto_rows)} auto-confirmed (exact match)", expanded=False):
+        with st.expander(f"✅  {len(auto_rows)} auto-confirmed", expanded=False):
             for r in auto_rows:
-                st.markdown(
-                    f'<span class="badge badge-exact">EXACT</span> '
-                    f'<b>{r.get("author_full", r.get("AuthorFullName",""))}</b>'
-                    f' → {r.get("AuthorFullName","")} [{r.get("PersonID","")}]'
-                    f' <span class="chip">{r.get("OrganizationID","")}</span>',
-                    unsafe_allow_html=True,
-                )
+                st.markdown(f'<span class="badge badge-exact">EXACT</span> '
+                            f'<b>{r.get("author_full",r.get("AuthorFullName",""))}</b>'
+                            f' → {r.get("AuthorFullName","")} [{r.get("PersonID","")}]'
+                            f' <span class="chip">{r.get("OrganizationID","")}</span>',
+                            unsafe_allow_html=True)
 
-    # ── Rows needing decision ─────────────────────────────────────────────────
+    # ── Locked view ───────────────────────────────────────────────────────────
     if status == "locked":
-        st.markdown('<div class="locked-ut">🔒 Publication confirmed — all authors resolved</div>',
-                    unsafe_allow_html=True)
-
-        # Show a summary of every decision made for this UT
-        if rev_rows:
-            with st.expander(f"🗒 {len(rev_rows)} resolved author(s) — click to review", expanded=False):
-                for r in rev_rows:
-                    raw_a = r.get("AuthorFullName", r.get("author_full", ""))
-                    norm_r = normalize_name(raw_a)
-                    dec_r  = st.session_state.author_decs.get((norm_r, ut), {})
-                    action = dec_r.get("action", "approve")
-                    mt_r   = dec_r.get("match_type", r.get("match_type", "new"))
-                    badge_map_r = {
-                        "initial_expansion": ("badge-initial", "INITIAL"),
-                        "fuzzy":             ("badge-fuzzy",   "FUZZY"),
-                        "new":               ("badge-new",     "NEW"),
-                        "resolved":          ("badge-exact",   "RESOLVED"),
-                    }
-                    bcls_r, blbl_r = badge_map_r.get(mt_r, ("badge-new", mt_r.upper()))
-                    if action == "reject":
-                        st.markdown(
-                            f'<span class="badge badge-dup">REJECTED</span> '                            f'<b>{raw_a}</b>',
-                            unsafe_allow_html=True,
-                        )
-                    else:
-                        org_ids_r = [o for o in dec_r.get("org_ids", []) if o]
-                        org_str_r = " ".join(f'<span class="chip">{o}</span>' for o in org_ids_r) or "—"
-                        st.markdown(
-                            f'<span class="badge {bcls_r}">{blbl_r}</span> '                            f'<b>{raw_a}</b> → '                            f'{dec_r.get("resolved_name", raw_a)} '                            f'[{dec_r.get("resolved_pid", "")}] '                            f'{org_str_r}',
-                            unsafe_allow_html=True,
-                        )
-
-        # Unlock must stay on this UT — do NOT advance index
+        st.markdown('<div class="locked-ut">🔒 Publication confirmed</div>', unsafe_allow_html=True)
+        _show_ut_upload_section(ut)
         if st.button("🔓 Unlock to re-edit", key=f"unlock_{ut}"):
             st.session_state.ut_locked[ut] = False
-            # Stay on this UT — explicitly write back the current index
             st.session_state.ut_index = idx
+            for d in ("ut_rows_cache","ut_upload_done","upload_log"):
+                st.session_state[d].pop(ut, None)
             st.rerun()
 
     elif status == "skip":
-        st.success("All authors for this publication are already in MyOrg — nothing to do.")
+        st.success("All authors already in MyOrg — nothing to do.")
 
     else:
-        # ── Author decision cards ──────────────────────────────────────────────
+        # ── Author cards ──────────────────────────────────────────────────────
         if rev_rows:
             st.markdown('<div class="sec-head">Authors needing a decision</div>',
                         unsafe_allow_html=True)
 
-        all_decided = True  # track whether we can enable Lock button
-
         for r in rev_rows:
-            raw_author = r.get("AuthorFullName", r.get("author_full", ""))
-            norm       = normalize_name(raw_author)
-            mt         = r.get("match_type", "new")
-            dec        = _get_dec(norm, ut)
+            raw  = r.get("AuthorFullName", r.get("author_full",""))
+            norm = normalize_name(raw)
+            mt   = r.get("match_type","new")
+            dec  = _get_dec(norm, ut)
 
             if not dec:
-                dec = {
-                    "decided":       False,
-                    "action":        "approve",   # approve | reject
-                    "resolved_pid":  r.get("suggested_pid", ""),
-                    "resolved_name": r.get("suggested_name", raw_author),
-                    "org_ids":       r.get("suggested_org_ids") or [""],
-                    "match_type":    mt,
-                    "_search":       "",
-                    "_search_ovr":   "",
-                }
+                dec = {"decided": False, "action": "approve",
+                       "resolved_pid": r.get("suggested_pid",""),
+                       "resolved_name": r.get("suggested_name", raw),
+                       "org_ids": r.get("suggested_org_ids") or [""],
+                       "match_type": mt, "_search": ""}
                 _set_dec(norm, ut, dec)
 
             decided = dec.get("decided", False)
-            if not decided:
-                all_decided = False
-
-            # Badge
-            badge_map = {
-                "initial_expansion": ("badge-initial", "INITIAL"),
-                "fuzzy":             ("badge-fuzzy",   "FUZZY"),
-                "new":               ("badge-new",     "NEW"),
-            }
-            bcls, blbl = badge_map.get(mt, ("badge-new", mt.upper()))
-
-            # Affil chips
-            chips = " ".join(
-                f'<span class="chip">{a}</span>'
-                for a in r.get("muv_affils", [r.get("RawAffil", "")])[:3]
-            )
-
-            # Card styling
-            card_cls = "author-row"
-            if decided:
-                if dec.get("action") == "reject":
-                    card_cls += " rejected"
-                else:
-                    card_cls += " locked"
-
-            st.markdown(f"""
-<div class="{card_cls}">
-  <span class="badge {bcls}">{blbl}</span>
-  <b>{raw_author}</b>
-  <span style="font-size:.75rem;color:#7a8fa0;margin-left:.5rem;">{chips}</span>
-</div>
-""", unsafe_allow_html=True)
+            bm = {"initial_expansion":("badge-initial","INITIAL"),
+                  "fuzzy":("badge-fuzzy","FUZZY"),"new":("badge-new","NEW")}
+            bcls, blbl = bm.get(mt, ("badge-new", mt.upper()))
+            chips = " ".join(f'<span class="chip">{a}</span>'
+                             for a in r.get("muv_affils",[r.get("RawAffil","")])[:3])
+            ccls = ("author-row locked"   if decided and dec.get("action")=="approve" else
+                    "author-row rejected" if decided and dec.get("action")=="reject"  else
+                    "author-row")
+            st.markdown(f'<div class="{ccls}"><span class="badge {bcls}">{blbl}</span>'
+                        f'<b>{raw}</b> <span style="font-size:.75rem;color:#7a8fa0;">{chips}</span></div>',
+                        unsafe_allow_html=True)
 
             with st.container():
                 left, right = st.columns([3, 2])
-
                 with left:
-                    # ── Identity picker ────────────────────────────────────────
                     cands = r.get("candidates", [])
-
-                    if mt in ("fuzzy", "initial_expansion") and cands:
-                        # Algorithm candidates + search override
-                        cand_labels = [
-                            f"[{p['PersonID']}] {p['AuthorFullName']}  ({s:.2f})"
-                            for s, p, _ in cands
-                        ]
-                        cand_labels.append("➕ Create as NEW PERSON")
-
-                        saved_choice = dec.get("_cand_choice", cand_labels[0])
-                        def_idx = cand_labels.index(saved_choice) if saved_choice in cand_labels else 0
-
-                        choice = st.selectbox(
-                            f"Identity for **{raw_author}**",
-                            cand_labels,
-                            index=def_idx,
-                            key=_safe_key("cand", norm, ut),
-                            disabled=decided,
-                        )
-                        dec["_cand_choice"] = choice
-
+                    if mt in ("fuzzy","initial_expansion") and cands:
+                        cl = [f"[{p['PersonID']}] {p['AuthorFullName']}  ({s:.2f})" for s,p,_ in cands]
+                        cl.append("➕ Create as NEW PERSON")
+                        sc = dec.get("_cand_choice", cl[0])
+                        di = cl.index(sc) if sc in cl else 0
+                        ch = st.selectbox(f"Identity for **{raw}**", cl, index=di,
+                                          key=_safe_key("cand",norm,ut), disabled=decided)
+                        dec["_cand_choice"] = ch
                         if not dec.get("_override_pid"):
-                            if "NEW PERSON" in choice:
-                                dec["resolved_pid"]  = r.get("suggested_pid", "")
-                                dec["resolved_name"] = raw_author
-                                dec["match_type"]    = "new"
-                                dec["org_ids"]       = [""]
+                            if "NEW PERSON" in ch:
+                                dec.update({"resolved_pid":r.get("suggested_pid",""),
+                                            "resolved_name":raw,"match_type":"new","org_ids":[""]})
                             else:
-                                idx_c = cand_labels.index(choice)
-                                _, cp, _ = cands[idx_c]
-                                dec["resolved_pid"]  = cp["PersonID"]
-                                dec["resolved_name"] = cp["AuthorFullName"]
-                                dec["match_type"]    = "resolved"
-                                dec["org_ids"] = cp.get("OrganizationIDs") or (
-                                    [cp["OrganizationID"]] if cp.get("OrganizationID") else [""])
+                                ic = cl.index(ch); _, cp, _ = cands[ic]
+                                dec.update({"resolved_pid":cp["PersonID"],
+                                            "resolved_name":cp["AuthorFullName"],
+                                            "match_type":"resolved",
+                                            "org_ids":cp.get("OrganizationIDs") or
+                                                      ([cp["OrganizationID"]] if cp.get("OrganizationID") else [""])})
 
-                    else:
-                        # New person — search picker
-                        search_key    = _safe_key("search", norm, ut)
-                        pick_key      = _safe_key("search_pick", norm, ut)
-                        NEW_LBL = f"➕ Create as NEW PERSON  (ID {r.get('suggested_pid','')})"
-
-                        # Read last saved query; default to raw author name on first render
-                        prev_query = dec.get("_search", raw_author)
-
-                        sq = st.text_input(
-                            f"Search existing for **{raw_author}**",
-                            value=prev_query,
-                            key=search_key,
-                            disabled=decided,
-                            placeholder="Type a name and press Enter…",
-                        )
-
-                        # Detect when the user has changed the query and clear the
-                        # selectbox widget state so it resets to the new results list.
-                        if sq != prev_query:
-                            dec["_search"] = sq
-                            dec["_search_choice"] = NEW_LBL   # reset selection
-                            # Wipe the selectbox widget state so Streamlit re-renders
-                            # it from index= instead of from stale session_state value
-                            st.session_state.pop(pick_key, None)
-
-                        hits = search_persons(sq, person_index)
-                        opts = [NEW_LBL] + [
-                            f"[{hp['PersonID']}] {hp['AuthorFullName']}  ·  {int(hs*100)}%"
-                            for hs, hp in hits
-                        ]
-                        hit_map = {
-                            f"[{hp['PersonID']}] {hp['AuthorFullName']}  ·  {int(hs*100)}%": hp
-                            for hs, hp in hits
-                        }
-
-                        # Show hit count hint below the text box
-                        if sq and sq != raw_author:
-                            if hits:
-                                st.caption(f"🔍 {len(hits)} match{'es' if len(hits)!=1 else ''} found")
-                            else:
-                                st.caption("No matches — will create as new person")
-
-                        saved_s = dec.get("_search_choice", NEW_LBL)
-                        s_def   = opts.index(saved_s) if saved_s in opts else 0
-
-                        sch = st.selectbox(
-                            f"Identity for **{raw_author}**",
-                            opts,
-                            index=s_def,
-                            key=pick_key,
-                            disabled=decided,
-                        )
-                        # Persist current choice and the query that produced it
-                        dec["_search_choice"] = sch
-                        dec["_search"] = sq
-
-                        if not dec.get("_override_pid"):
-                            if sch == NEW_LBL:
-                                dec["resolved_pid"]  = r.get("suggested_pid", "")
-                                dec["resolved_name"] = raw_author
-                                dec["match_type"]    = "new"
-                                dec["org_ids"]       = [""]
-                            else:
-                                hp = hit_map[sch]
-                                dec["resolved_pid"]  = hp["PersonID"]
-                                dec["resolved_name"] = hp["AuthorFullName"]
-                                dec["match_type"]    = "resolved"
-                                dec["org_ids"] = hp.get("OrganizationIDs") or (
-                                    [hp["OrganizationID"]] if hp.get("OrganizationID") else [""])
-
-                    # ── Override search (for fuzzy/initial) ───────────────────
-                    if mt in ("fuzzy", "initial_expansion"):
-                        ovr_active = bool(dec.get("_override_pid"))
-                        ovr_lbl = (
-                            f"✏️ Override: {dec.get('resolved_name','')} [{dec.get('resolved_pid','')}]"
-                            if ovr_active else "🔍 Not right? Search full list"
-                        )
-                        with st.expander(ovr_lbl, expanded=ovr_active):
-                            if ovr_active and not decided:
-                                if st.button("✖ Clear override",
-                                             key=_safe_key("clr_ovr", norm, ut)):
+                        ovr_a = bool(dec.get("_override_pid"))
+                        ovr_l = (f"✏️ Override: {dec.get('resolved_name','')} [{dec.get('resolved_pid','')}]"
+                                 if ovr_a else "🔍 Not right? Search full list")
+                        with st.expander(ovr_l, expanded=ovr_a):
+                            if ovr_a and not decided:
+                                if st.button("✖ Clear override", key=_safe_key("clr_ovr",norm,ut)):
                                     for k in ("_override_pid","_override_query","_override_choice"):
-                                        dec.pop(k, None)
-                                    _set_dec(norm, ut, dec)
-                                    st.rerun()
-
-                            ovr_q_key    = _safe_key("ovr_q",    norm, ut)
-                            ovr_pick_key = _safe_key("ovr_pick", norm, ut)
-                            prev_ovq = dec.get("_override_query", "")
-
-                            ovq = st.text_input(
-                                "Search",
-                                value=prev_ovq,
-                                key=ovr_q_key,
-                                disabled=decided,
-                                placeholder="Type a name and press Enter…",
-                            )
-
-                            # Clear selectbox state when query changes
-                            if ovq != prev_ovq:
-                                dec["_override_query"] = ovq
-                                dec.pop("_override_choice", None)
-                                st.session_state.pop(ovr_pick_key, None)
-
-                            dec["_override_query"] = ovq
-
+                                        dec.pop(k,None)
+                                    _set_dec(norm,ut,dec); st.rerun()
+                            ovr_qk = _safe_key("ovr_q",norm,ut)
+                            ovr_pk = _safe_key("ovr_pick",norm,ut)
+                            pq = dec.get("_override_query","")
+                            ovq = st.text_input("Search",value=pq,key=ovr_qk,
+                                                disabled=decided,placeholder="Type a name…")
+                            if ovq != pq:
+                                dec["_override_query"]=ovq; dec.pop("_override_choice",None)
+                                st.session_state.pop(ovr_pk,None)
+                            dec["_override_query"]=ovq
                             if ovq:
                                 oh = search_persons(ovq, person_index)
                                 if oh:
-                                    st.caption(f"🔍 {len(oh)} match{'es' if len(oh)!=1 else ''} found")
-                                    NEW_OVR = f"➕ Create as NEW PERSON  (ID {r.get('suggested_pid','')})"
-                                    o_opts  = [NEW_OVR] + [
-                                        f"[{hp['PersonID']}] {hp['AuthorFullName']}  ·  {int(hs*100)}%"
-                                        for hs, hp in oh
-                                    ]
-                                    o_map   = {
-                                        f"[{hp['PersonID']}] {hp['AuthorFullName']}  ·  {int(hs*100)}%": hp
-                                        for hs, hp in oh
-                                    }
-                                    saved_o = dec.get("_override_choice", NEW_OVR)
-                                    o_def   = o_opts.index(saved_o) if saved_o in o_opts else 0
-                                    oc = st.selectbox(
-                                        "Select",
-                                        o_opts,
-                                        index=o_def,
-                                        key=ovr_pick_key,
-                                        disabled=decided,
-                                    )
-                                    dec["_override_choice"] = oc
-                                    if oc != NEW_OVR:
-                                        op = o_map[oc]
-                                        dec["resolved_pid"]    = op["PersonID"]
-                                        dec["resolved_name"]   = op["AuthorFullName"]
-                                        dec["match_type"]      = "resolved"
-                                        dec["_override_pid"]   = op["PersonID"]
-                                        new_org = op.get("OrganizationIDs") or (
-                                            [op["OrganizationID"]] if op.get("OrganizationID") else [])
-                                        dec["org_ids"] = new_org or [""]
-                                        # push to multiselect key
-                                        ok = _safe_key("orgs", norm, ut)
-                                        valid = [org_label(o, org_map) for o in new_org if o]
-                                        valid = [l for l in valid if l in org_map]
-                                        if valid:
-                                            st.session_state[ok] = valid
+                                    st.caption(f"🔍 {len(oh)} match{'es' if len(oh)!=1 else ''}")
+                                    NO = f"➕ Create as NEW PERSON  (ID {r.get('suggested_pid','')})"
+                                    oo = [NO]+[f"[{hp['PersonID']}] {hp['AuthorFullName']}  ·  {int(hs*100)}%" for hs,hp in oh]
+                                    om = {f"[{hp['PersonID']}] {hp['AuthorFullName']}  ·  {int(hs*100)}%":hp for hs,hp in oh}
+                                    so = dec.get("_override_choice",NO)
+                                    od = oo.index(so) if so in oo else 0
+                                    oc = st.selectbox("Select",oo,index=od,key=ovr_pk,disabled=decided)
+                                    dec["_override_choice"]=oc
+                                    if oc != NO:
+                                        op=om[oc]; no=op.get("OrganizationIDs") or ([op["OrganizationID"]] if op.get("OrganizationID") else [])
+                                        dec.update({"resolved_pid":op["PersonID"],"resolved_name":op["AuthorFullName"],
+                                                    "match_type":"resolved","_override_pid":op["PersonID"],"org_ids":no or [""]})
+                                        ok2=_safe_key("orgs",norm,ut)
+                                        vl=[org_label(o,org_map) for o in no if o]; vl=[l for l in vl if l in org_map]
+                                        if vl: st.session_state[ok2]=vl
                                     else:
-                                        dec["resolved_pid"]  = r.get("suggested_pid", "")
-                                        dec["resolved_name"] = raw_author
-                                        dec["match_type"]    = "new"
-                                        dec["org_ids"]       = [""]
-                                        dec.pop("_override_pid", None)
+                                        dec.update({"resolved_pid":r.get("suggested_pid",""),"resolved_name":raw,
+                                                    "match_type":"new","org_ids":[""]}); dec.pop("_override_pid",None)
                                 else:
                                     st.caption("No matches found.")
+                    else:
+                        sk = _safe_key("search",norm,ut); pk = _safe_key("search_pick",norm,ut)
+                        NL = f"➕ Create as NEW PERSON  (ID {r.get('suggested_pid','')})"
+                        pq2 = dec.get("_search", raw)
+                        sq = st.text_input(f"Search existing for **{raw}**", value=pq2, key=sk,
+                                           disabled=decided, placeholder="Type a name and press Enter…")
+                        if sq != pq2:
+                            dec["_search"]=sq; dec["_search_choice"]=NL; st.session_state.pop(pk,None)
+                        hits = search_persons(sq, person_index)
+                        opts = [NL]+[f"[{hp['PersonID']}] {hp['AuthorFullName']}  ·  {int(hs*100)}%" for hs,hp in hits]
+                        hm   = {f"[{hp['PersonID']}] {hp['AuthorFullName']}  ·  {int(hs*100)}%":hp for hs,hp in hits}
+                        if sq and sq != raw:
+                            st.caption(f"🔍 {len(hits)} match{'es' if len(hits)!=1 else ''}" if hits else "No matches")
+                        ss = dec.get("_search_choice",NL); sd = opts.index(ss) if ss in opts else 0
+                        sch = st.selectbox(f"Identity for **{raw}**", opts, index=sd, key=pk, disabled=decided)
+                        dec["_search_choice"]=sch; dec["_search"]=sq
+                        if not dec.get("_override_pid"):
+                            if sch==NL:
+                                dec.update({"resolved_pid":r.get("suggested_pid",""),"resolved_name":raw,
+                                            "match_type":"new","org_ids":[""]})
+                            else:
+                                hp=hm[sch]
+                                dec.update({"resolved_pid":hp["PersonID"],"resolved_name":hp["AuthorFullName"],
+                                            "match_type":"resolved",
+                                            "org_ids":hp.get("OrganizationIDs") or ([hp["OrganizationID"]] if hp.get("OrganizationID") else [""])})
 
-                    # ── Show who will be used ──────────────────────────────────
                     if dec.get("resolved_pid") and dec.get("resolved_name"):
-                        if dec["match_type"] == "new":
-                            st.caption(f"📋 Will be created as **{dec['resolved_name']}** (new ID {dec['resolved_pid']})")
+                        if dec["match_type"]=="new":
+                            st.caption(f"📋 New person · ID {dec['resolved_pid']}")
                         else:
-                            st.caption(f"✔ Resolves to **{dec['resolved_name']}** (ID {dec['resolved_pid']})")
-                            # Immediate duplicate warning
-                            ep = st.session_state.existing_pairs
-                            for it in [r]:
-                                if (dec["resolved_pid"], it.get("UT","")) in ep:
-                                    st.warning(f"⚠️ Already in MyOrg — will be skipped on save.")
+                            st.caption(f"✔ → {dec['resolved_name']} (ID {dec['resolved_pid']})")
+                            if (dec["resolved_pid"], ut) in st.session_state.existing_pairs:
+                                st.warning("⚠️ Already in MyOrg — skipped on upload.")
 
                 with right:
-                    # ── Org picker ────────────────────────────────────────────
-                    ok = _safe_key("orgs", norm, ut)
-                    # Build default list
-                    default_labels = [
-                        org_label(o, org_map)
-                        for o in dec.get("org_ids", [""])
-                        if o and org_label(o, org_map) in org_map
-                    ]
-                    sel_orgs = st.multiselect(
-                        "Organisation(s)",
-                        options=list(org_map.keys()),
-                        default=default_labels if ok not in st.session_state else None,
-                        key=ok,
-                        disabled=decided,
-                    )
-                    dec["org_ids"] = [org_map[l] for l in sel_orgs] or [""]
+                    ok3 = _safe_key("orgs",norm,ut)
+                    dl  = [org_label(o,org_map) for o in dec.get("org_ids",[""]) if o and org_label(o,org_map) in org_map]
+                    sel = st.multiselect("Organisation(s)", list(org_map.keys()),
+                                         default=dl if ok3 not in st.session_state else None,
+                                         key=ok3, disabled=decided)
+                    dec["org_ids"] = [org_map[l] for l in sel] or [""]
 
-                    # ── Approve / Reject ──────────────────────────────────────
                     st.markdown("")
-                    a_col, r_col = st.columns(2)
-                    with a_col:
-                        ap_key = _safe_key("approve", norm, ut)
-                        if st.button(
-                            "✅ Approve" if not decided or dec.get("action") == "reject" else "✅ Approved",
-                            key=ap_key,
-                            use_container_width=True,
-                            type="primary" if not decided else "secondary",
-                            disabled=(decided and dec.get("action") == "approve"),
-                        ):
-                            dec["decided"] = True
-                            dec["action"]  = "approve"
-                            _set_dec(norm, ut, dec)
-                            st.rerun()
-
-                    with r_col:
-                        rj_key = _safe_key("reject", norm, ut)
-                        if st.button(
-                            "❌ Reject" if not decided or dec.get("action") == "approve" else "❌ Rejected",
-                            key=rj_key,
-                            use_container_width=True,
-                            disabled=(decided and dec.get("action") == "reject"),
-                        ):
-                            dec["decided"] = True
-                            dec["action"]  = "reject"
-                            _set_dec(norm, ut, dec)
-                            st.rerun()
-
+                    ac, rc = st.columns(2)
+                    with ac:
+                        if st.button("✅ Approve" if not decided or dec.get("action")=="reject" else "✅ Approved",
+                                     key=_safe_key("approve",norm,ut), use_container_width=True,
+                                     type="primary" if not decided else "secondary",
+                                     disabled=(decided and dec.get("action")=="approve")):
+                            dec["decided"]=True; dec["action"]="approve"; _set_dec(norm,ut,dec); st.rerun()
+                    with rc:
+                        if st.button("❌ Reject" if not decided or dec.get("action")=="approve" else "❌ Rejected",
+                                     key=_safe_key("reject",norm,ut), use_container_width=True,
+                                     disabled=(decided and dec.get("action")=="reject")):
+                            dec["decided"]=True; dec["action"]="reject"; _set_dec(norm,ut,dec); st.rerun()
                     if decided:
-                        if st.button("✏️ Undo", key=_safe_key("undo", norm, ut),
-                                     use_container_width=True):
-                            dec["decided"] = False
-                            _set_dec(norm, ut, dec)
-                            st.rerun()
+                        if st.button("✏️ Undo", key=_safe_key("undo",norm,ut), use_container_width=True):
+                            dec["decided"]=False; _set_dec(norm,ut,dec); st.rerun()
 
             _set_dec(norm, ut, dec)
             st.markdown("<hr style='margin:.5rem 0;border-color:#e0e8ef;'>", unsafe_allow_html=True)
 
-        # ── Lock button ───────────────────────────────────────────────────────
+        # ── Confirm & Upload button ────────────────────────────────────────────
         st.markdown("")
         can_lock = _all_authors_decided(ut) or not rev_rows
-
-        lock_help = "" if can_lock else "Decide all authors above before locking."
-        if st.button(
-            "🔒 Confirm & Lock Publication",
-            type="primary",
-            use_container_width=True,
-            disabled=not can_lock,
-            help=lock_help,
-            key=f"lock_{ut}",
-        ):
+        if st.button("🔒 Confirm & Upload Publication",
+                     type="primary", use_container_width=True,
+                     disabled=not can_lock,
+                     help="" if can_lock else "Decide all authors first.",
+                     key=f"lock_{ut}"):
             st.session_state.ut_locked[ut] = True
-            # Advance to next unlocked UT if possible
-            for i in range(idx + 1, len(ut_order)):
-                next_ut = ut_order[i]
-                if not st.session_state.ut_locked.get(next_ut) and _ut_status(next_ut) != "skip":
-                    st.session_state.ut_index = i
-                    break
-            else:
-                st.session_state.ut_index = min(idx + 1, len(ut_order) - 1)
+            _build_ut_rows(ut)
             st.rerun()
 
-    # ── Sidebar mini-map ──────────────────────────────────────────────────────
-    with st.sidebar:
-        st.markdown("### Publication list")
-        for i, u in enumerate(ut_order):
-            icon = "✅" if _ut_is_done(u) else ("⏳" if _ut_needs_attention(u) else "—")
-            if st.button(f"{icon} {u}", key=f"sb_{i}", use_container_width=True):
-                st.session_state.ut_index = i
-                st.rerun()
-
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 3 — EXPORT
+# TAB 3 — UPLOAD LOG
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_export:
+with tab_log:
     if not st.session_state.processed:
-        st.info("⬅️ Complete Tabs 1 and 2 first.")
+        st.info("⬅️ Load files in Tab 1 first.")
         st.stop()
 
-    result       = st.session_state.batch_result
-    ut_order     = st.session_state.ut_order
-    existing_pairs = st.session_state.existing_pairs
-
-    n_locked = sum(1 for ut in ut_order
-                   if st.session_state.ut_locked.get(ut) or _ut_status(ut) == "skip")
-    n_total  = len(ut_order)
-    n_pending = n_total - n_locked
-
-    if n_pending > 0:
-        st.warning(f"⚠️ **{n_pending} publication(s) not yet locked.** "
-                   f"You can still export — unlocked publications will be included as-is, "
-                   f"with unapproved authors omitted.")
-
-    if st.button("⚙️ Build export", type="primary", use_container_width=True):
-        output_rows   = []
-        rejected_rows = []
-        seen: set[tuple] = set()
-
-        # 1 — Auto-confirmed exact rows
-        for r in result["confirmed"]:
-            k = (r["PersonID"], r.get("UT",""), r.get("OrganizationID",""))
-            if k not in seen:
-                seen.add(k)
-                output_rows.append(r)
-
-        # 2 — User decisions
-        for r in result["needs_review"]:
-            raw_author = r.get("AuthorFullName", r.get("author_full",""))
-            norm = normalize_name(raw_author)
-            ut   = r.get("UT","")
-            dec  = st.session_state.author_decs.get((norm, ut))
-
-            if not dec or dec.get("action") == "reject" or not dec.get("decided"):
-                rejected_rows.append({
-                    "AuthorFullName": raw_author, "UT": ut,
-                    "Reason": "Rejected" if (dec and dec.get("action") == "reject") else "Not decided",
-                })
-                continue
-
-            pid           = str(dec.get("resolved_pid","")).strip()
-            resolved_name = dec.get("resolved_name", raw_author)
-            org_ids       = [o for o in dec.get("org_ids",[""])  if o] or [""]
-
-            # Check against existing_pairs (resolved-to-existing may already be there)
-            if pid and (pid, ut) in existing_pairs:
-                rejected_rows.append({
-                    "AuthorFullName": resolved_name, "UT": ut,
-                    "Reason": "Already in MyOrg (resolved match)",
-                })
-                continue
-
-            for oid in org_ids:
-                k = (pid, ut, oid)
-                if k in seen:
-                    rejected_rows.append({"AuthorFullName": resolved_name, "UT": ut, "Reason": "Duplicate"})
-                    continue
-                seen.add(k)
-                output_rows.append({
-                    "PersonID": pid, "AuthorFullName": resolved_name,
-                    "UT": ut, "OrganizationID": oid,
-                    "match_type": dec.get("match_type",""),
-                })
-
-        st.session_state.output_rows   = output_rows
-        st.session_state.rejected_rows = rejected_rows
-        st.session_state.finalized     = True
-        st.success(f"✅ {len(output_rows)} rows ready · {len(rejected_rows)} excluded.")
-
-    if st.session_state.finalized:
-        output_rows   = st.session_state.output_rows
-        rejected_rows = st.session_state.rejected_rows
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        src = st.session_state.source_file
-
-        c1, c2 = st.columns(2)
-
-        with c1:
-            st.markdown("#### Upload-ready CSV")
-            csv_bytes = build_upload_csv(output_rows, src).encode("utf-8")
-            st.download_button(
-                "⬇️ Download upload_ready.csv",
-                data=csv_bytes,
-                file_name=f"upload_ready_{ts}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-            st.dataframe(
-                pd.DataFrame(output_rows)[["PersonID","AuthorFullName","UT","OrganizationID"]]
-                if output_rows else pd.DataFrame(),
-                use_container_width=True, height=300,
-            )
-
-        with c2:
-            st.markdown("#### Excluded rows")
-            if rejected_rows:
-                st.download_button(
-                    "⬇️ Download excluded.csv",
-                    data=pd.DataFrame(rejected_rows).to_csv(index=False).encode("utf-8"),
-                    file_name=f"excluded_{ts}.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
-                st.dataframe(pd.DataFrame(rejected_rows), use_container_width=True, height=300)
-            else:
-                st.success("No excluded rows.")
-
-        # New persons CSV
-        new_pids = sorted({
-            r["PersonID"] for r in output_rows
-            if r.get("match_type") == "new"
-        })
-        if new_pids:
-            st.markdown("#### New persons to register")
-            st.caption("These PersonIDs are new — add them to ResearcherAndDocument.csv before the next run.")
-            new_person_names = {
-                dec["resolved_pid"]: dec["resolved_name"]
-                for (norm_k, ut_k), dec in st.session_state.author_decs.items()
-                if dec.get("match_type") == "new" and dec.get("action") == "approve"
-            }
-            new_rows = [{"PersonID": pid, "SuggestedName": new_person_names.get(pid, "")}
-                        for pid in new_pids]
-            st.dataframe(pd.DataFrame(new_rows), use_container_width=True)
-            st.download_button(
-                "⬇️ Download new_persons.csv",
-                data=pd.DataFrame(new_rows).to_csv(index=False).encode("utf-8"),
-                file_name=f"new_persons_{ts}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 4 — UPLOAD TO MYORG API
-# ══════════════════════════════════════════════════════════════════════════════
-with tab_upload:
-    st.markdown("""
-<style>
-.upload-row {
-    display:flex; align-items:center; gap:.7rem;
-    padding:.45rem .9rem; border-radius:5px; margin:.2rem 0;
-    font-family:'IBM Plex Mono',monospace; font-size:.78rem;
-}
-.upload-row.ok      { background:#f0faf4; border-left:3px solid #27ae60; }
-.upload-row.skip    { background:#f5f5f5; border-left:3px solid #aaa; }
-.upload-row.error   { background:#fff5f5; border-left:3px solid #e74c3c; }
-.upload-row.pending { background:#fefaf0; border-left:3px solid #e67e22; }
-.up-icon { font-size:1rem; min-width:1.2rem; }
-.up-pid  { color:#1a9dc8; min-width:5rem; }
-.up-name { color:#2c3e50; min-width:16rem; }
-.up-ut   { color:#7a8fa0; min-width:16rem; }
-.up-msg  { color:#555; }
-.stat-pill {
-    display:inline-block; padding:.2rem .7rem; border-radius:20px;
-    font-size:.75rem; font-weight:600; margin-right:.4rem;
-    font-family:'IBM Plex Mono',monospace;
-}
-.pill-ok    { background:#d4edda; color:#155724; }
-.pill-skip  { background:#e2e3e5; color:#383d41; }
-.pill-err   { background:#f8d7da; color:#721c24; }
-.pill-total { background:#d1ecf1; color:#0c5460; }
-</style>
-""", unsafe_allow_html=True)
-
-    st.markdown('<div class="sec-head">MyOrg API Upload</div>', unsafe_allow_html=True)
-
-    if not st.session_state.processed:
-        st.info("⬅️ Complete Tabs 1–3 first.")
-        st.stop()
-
-    if not st.session_state.finalized:
-        st.warning("⚠️ Finalise your decisions in Tab 3 before uploading.")
-        st.stop()
-
-    output_rows = st.session_state.output_rows
-    if not output_rows:
-        st.info("No rows to upload — all entries were excluded.")
-        st.stop()
-
-    # ── API key input ─────────────────────────────────────────────────────────
-    st.markdown("#### 1 · API credentials")
-    col_key, col_mode = st.columns([3, 1])
-    with col_key:
-        api_key = st.text_input(
-            "Clarivate API Key",
-            type="password",
-            key="api_key_input",
-            placeholder="Paste your X-ApiKey here…",
-            help="Your Clarivate developer key — never stored or logged",
-        )
-    with col_mode:
-        dry_run = st.checkbox(
-            "🔬 Dry run",
-            value=True,
-            key="dry_run_toggle",
-            help="Simulate all API calls without actually sending data. "
-                 "Uncheck only when ready to go live.",
-        )
-        if dry_run:
-            st.caption("No real calls will be made.")
-        else:
-            st.caption("⚠️ Live mode — real calls.")
-
-    if not api_key and not dry_run:
-        st.error("Enter your API key, or enable Dry Run to test without one.")
-        st.stop()
-
-    # ── Connection test ───────────────────────────────────────────────────────
-    st.markdown("#### 2 · Test connection")
-    if st.button("🔌 Test API connection", key="test_conn_btn"):
-        client = MyOrgClient(api_key or "test", dry_run=dry_run)
-        with st.spinner("Testing…"):
-            res = client.test_connection()
-        if res.success:
-            st.success(f"✅ {res.message}")
-        else:
-            st.error(f"❌ {res.message}")
-
-    # ── Upload plan preview ───────────────────────────────────────────────────
-    st.markdown("#### 3 · Upload plan")
-
-    # Classify rows: new person vs existing person
-    new_person_pids = {
-        r.get("PersonID", "")
-        for r in output_rows
-        if r.get("match_type") == "new"
-    }
-    # Build name lookup from author_decs
-    new_person_names: dict[str, tuple[str, str]] = {}  # pid → (first, last)
-    for (norm_k, ut_k), dec in st.session_state.author_decs.items():
-        if dec.get("match_type") == "new" and dec.get("action") == "approve":
-            pid  = str(dec.get("resolved_pid", "")).strip()
-            name = dec.get("resolved_name", "")
-            if pid and "," in name:
-                last, _, first = name.partition(",")
-                new_person_names[pid] = (first.strip(), last.strip())
-            elif pid:
-                new_person_names[pid] = ("", name.strip())
-
-    n_new = sum(1 for r in output_rows if r.get("PersonID","") in new_person_pids)
-    n_exist = len(output_rows) - n_new
+    ulog  = st.session_state.upload_log
+    dry   = st.session_state.global_dry_run
+    t_row = sum(len(v) for v in ulog.values())
+    t_ok  = sum(1 for v in ulog.values() for e in v if e["overall"]=="ok")
+    t_sk  = sum(1 for v in ulog.values() for e in v if e["overall"]=="skipped")
+    t_er  = sum(1 for v in ulog.values() for e in v if e["overall"]=="error")
 
     st.markdown(f"""
 <div class="metric-grid">
-  <div class="metric-card">
-    <div class="num num-blue">{len(output_rows)}</div>
-    <div class="lbl">Total rows to upload</div>
-  </div>
-  <div class="metric-card">
-    <div class="num num-green">{n_new}</div>
-    <div class="lbl">New persons to create</div>
-  </div>
-  <div class="metric-card">
-    <div class="num">{n_exist}</div>
-    <div class="lbl">Existing persons / new pubs</div>
-  </div>
-</div>
-""", unsafe_allow_html=True)
+  <div class="metric-card"><div class="num num-blue">{len(ulog)}</div><div class="lbl">UTs processed</div></div>
+  <div class="metric-card"><div class="num num-green">{t_ok}</div><div class="lbl">{'Simulated' if dry else 'Uploaded'}</div></div>
+  <div class="metric-card"><div class="num">{t_sk}</div><div class="lbl">Skipped</div></div>
+  <div class="metric-card"><div class="num num-red">{t_er}</div><div class="lbl">Errors</div></div>
+  <div class="metric-card"><div class="num">{t_row}</div><div class="lbl">Total rows</div></div>
+</div>""", unsafe_allow_html=True)
 
-    with st.expander("Preview rows to upload", expanded=False):
-        prev_df = pd.DataFrame(output_rows)[["PersonID","AuthorFullName","UT","OrganizationID","match_type"]]
-        prev_df["is_new_person"] = prev_df["PersonID"].isin(new_person_pids)
-        st.dataframe(prev_df, use_container_width=True, height=260)
+    if not ulog:
+        st.info("No uploads yet — confirm publications in Tab 2.")
+        st.stop()
 
-    # ── Upload controls ───────────────────────────────────────────────────────
-    st.markdown("#### 4 · Run upload")
+    all_e = [{"UT":ut,**e} for ut,es in ulog.items() for e in es]
+    ts    = datetime.now().strftime("%Y%m%d_%H%M%S")
+    st.download_button("⬇️ Download full log CSV",
+                       pd.DataFrame(all_e).to_csv(index=False).encode("utf-8"),
+                       f"upload_log_{ts}.csv", "text/csv")
 
-    delay = st.slider(
-        "Delay between API calls (seconds)",
-        min_value=0.0, max_value=2.0, value=0.3, step=0.1,
-        help="Throttle to avoid rate-limit errors. 0.3 s is safe for most keys.",
-        key="upload_delay",
-    )
-
-    col_start, col_reset = st.columns([2, 1])
-    with col_reset:
-        if st.button("🗑 Reset upload log", key="reset_upload"):
-            st.session_state.upload_log  = []
-            st.session_state.upload_done = False
-            st.rerun()
-    with col_start:
-        already_done = st.session_state.upload_done
-        start_label  = "✅ Upload complete — click to re-run" if already_done else (
-            f"🚀 {'Simulate' if dry_run else 'Start'} upload  ({len(output_rows)} rows)"
-        )
-        run_upload = st.button(
-            start_label,
-            type="primary",
-            use_container_width=True,
-            key="run_upload_btn",
-        )
-
-    # ── Live upload execution ─────────────────────────────────────────────────
-    if run_upload:
-        st.session_state.upload_log  = []
-        st.session_state.upload_done = False
-
-        client = MyOrgClient(api_key or "test", dry_run=dry_run)
-
-        progress_bar  = st.progress(0)
-        status_text   = st.empty()
-        log_container = st.container()
-        n_total = len(output_rows)
-
-        for i, row in enumerate(output_rows):
-            pid  = str(row.get("PersonID","")).strip()
-            oid  = str(row.get("OrganizationID","")).strip()
-            ut   = str(row.get("UT","")).strip()
-            name = row.get("AuthorFullName","")
-            is_new = pid in new_person_pids
-
-            first_name, last_name = new_person_names.get(pid, ("", ""))
-            if not first_name and not last_name and "," in name:
-                last_name, _, first_name = name.partition(",")
-                first_name = first_name.strip()
-                last_name  = last_name.strip()
-
-            status_text.markdown(
-                f"<small>Uploading {i+1}/{n_total} — "
-                f"<b>{name}</b> / {ut}</small>",
-                unsafe_allow_html=True,
-            )
-
-            result = client.upload_row(
-                row=row,
-                is_new_person=is_new,
-                first_name=first_name,
-                last_name=last_name,
-                delay=delay,
-            )
-
-            log_entry = {
-                "idx":       i + 1,
-                "pid":       pid,
-                "name":      name,
-                "ut":        ut,
-                "oid":       oid,
-                "is_new":    is_new,
-                "overall":   result["overall"],
-                "p_status":  result["person_step"].status if result["person_step"] else None,
-                "p_msg":     result["person_step"].message if result["person_step"] else "",
-                "pub_status": result["pub_step"].status if result["pub_step"] else None,
-                "pub_msg":   result["pub_step"].message if result["pub_step"] else "",
-            }
-            st.session_state.upload_log.append(log_entry)
-            progress_bar.progress((i + 1) / n_total)
-
-        status_text.empty()
-        st.session_state.upload_done = True
-        st.rerun()
-
-    # ── Results display ───────────────────────────────────────────────────────
-    if st.session_state.upload_log:
-        log = st.session_state.upload_log
-        n_ok    = sum(1 for e in log if e["overall"] == "ok")
-        n_skip  = sum(1 for e in log if e["overall"] == "skipped")
-        n_err   = sum(1 for e in log if e["overall"] == "error")
-
-        done_label = "✅ Upload complete" if st.session_state.upload_done else "⏳ In progress"
-        st.markdown(f"""
-<div style="margin:1rem 0 .5rem;">
-  <b>{done_label}</b> &nbsp;
-  <span class="stat-pill pill-total">{len(log)} processed</span>
-  <span class="stat-pill pill-ok">✓ {n_ok} uploaded</span>
-  <span class="stat-pill pill-skip">⏭ {n_skip} skipped (already exists)</span>
-  <span class="stat-pill pill-err">✗ {n_err} errors</span>
-</div>
-""", unsafe_allow_html=True)
-
-        # Filter tabs
-        filt = st.radio(
-            "Show",
-            ["All", "Uploaded", "Skipped", "Errors"],
-            horizontal=True,
-            key="upload_log_filter",
-        )
-
-        icon_map = {"ok": "✅", "skipped": "⏭", "error": "❌"}
-        cls_map  = {"ok": "ok", "skipped": "skip", "error": "error"}
-
-        for entry in log:
-            overall = entry["overall"]
-            if filt == "Uploaded" and overall != "ok":       continue
-            if filt == "Skipped"  and overall != "skipped":  continue
-            if filt == "Errors"   and overall != "error":     continue
-
-            icon = icon_map.get(overall, "⏳")
-            cls  = cls_map.get(overall, "pending")
-            new_badge = ' <span style="color:#9b59b6;font-size:.7rem;">NEW</span>' \
-                        if entry["is_new"] else ""
-            p_info  = f"person:{entry['p_status']}" if entry["p_status"] else ""
-            pub_info = f"pub:{entry['pub_status']}"  if entry["pub_status"] else ""
-            detail  = " · ".join(filter(None, [p_info, pub_info, entry["pub_msg"]]))
-
-            st.markdown(f"""
-<div class="upload-row {cls}">
-  <span class="up-icon">{icon}</span>
-  <span class="up-pid">{entry['pid']}</span>
-  <span class="up-name">{entry['name']}{new_badge}</span>
-  <span class="up-ut">{entry['ut']}</span>
-  <span class="up-msg">{detail[:120]}</span>
-</div>
-""", unsafe_allow_html=True)
-
-        # ── Error detail expander ─────────────────────────────────────────────
-        errors = [e for e in log if e["overall"] == "error"]
-        if errors:
-            with st.expander(f"⚠ {len(errors)} error(s) — click to inspect", expanded=True):
-                for e in errors:
-                    st.markdown(
-                        f"**{e['name']}** (ID {e['pid']}) / `{e['ut']}`  \n"
-                        f"Person step: `{e['p_msg']}`  \n"
-                        f"Pub step: `{e['pub_msg']}`"
-                    )
-                    st.markdown("---")
-
-        # ── Download log ──────────────────────────────────────────────────────
-        st.markdown("")
-        log_df = pd.DataFrame(log)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        st.download_button(
-            "⬇️ Download upload log CSV",
-            data=log_df.to_csv(index=False).encode("utf-8"),
-            file_name=f"upload_log_{ts}.csv",
-            mime="text/csv",
-            use_container_width=False,
-        )
+    st.markdown('<div class="sec-head">Per-publication</div>', unsafe_allow_html=True)
+    for ut, entries in ulog.items():
+        nok=sum(1 for e in entries if e["overall"]=="ok")
+        nsk=sum(1 for e in entries if e["overall"]=="skipped")
+        ner=sum(1 for e in entries if e["overall"]=="error")
+        with st.expander(f"{'⚠' if ner else '🚀'} {ut}  —  ✓{nok} ⏭{nsk} ✗{ner}",
+                         expanded=(ner>0)):
+            for e in entries:
+                icon={"ok":"✅","skipped":"⏭","error":"❌"}.get(e["overall"],"⏳")
+                nb=" <b style='color:#9b59b6;font-size:.7rem;'>NEW</b>" if e["is_new"] else ""
+                msg=(e.get("pub_msg") or e.get("p_msg") or "")[:120]
+                st.markdown(
+                    f'<div class="upl-result {e["overall"]}">'
+                    f'<span>{icon}</span><span class="r-pid">{e["pid"]}</span>'
+                    f'<span class="r-name">{e["name"]}{nb}</span>'
+                    f'<span class="r-msg">{msg}</span></div>',
+                    unsafe_allow_html=True)

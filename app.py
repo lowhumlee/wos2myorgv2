@@ -17,6 +17,7 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
+from myorg_api import MyOrgClient, ApiResult
 from core import (
     load_config,
     build_person_index,
@@ -168,6 +169,8 @@ def _init():
         "orgs":            [],
         "cfg":             {},
         "source_file":     "",
+        "upload_log":      [],   # list of per-row upload result dicts
+        "upload_done":     False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -258,10 +261,11 @@ def _set_dec(norm: str, ut: str, dec: dict):
 
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_load, tab_review, tab_export = st.tabs([
+tab_load, tab_review, tab_export, tab_upload = st.tabs([
     "📂 1 · Load Files",
     "🔍 2 · Review by Publication",
     "⬇️ 3 · Export",
+    "🚀 4 · Upload to MyOrg API",
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -392,13 +396,25 @@ with tab_review:
         st.stop()
 
     # ── Progress bar ─────────────────────────────────────────────────────────
-    n_locked = sum(1 for ut in ut_order if st.session_state.ut_locked.get(ut) or _ut_status(ut) == "skip")
-    pct = int(100 * n_locked / len(ut_order)) if ut_order else 100
+    def _ut_is_done(ut: str) -> bool:
+        """True when nothing more is needed for this UT."""
+        if st.session_state.ut_locked.get(ut):
+            return True
+        if _ut_status(ut) == "skip":
+            return True
+        # UTs with ONLY auto-confirmed rows (no needs_review) need no user action
+        if not _ut_needs_attention(ut):
+            return True
+        return False
+
+    n_done = sum(1 for ut in ut_order if _ut_is_done(ut))
+    n_need = sum(1 for ut in ut_order if _ut_needs_attention(ut))
+    pct = int(100 * n_done / len(ut_order)) if ut_order else 100
 
     st.markdown(f"""
 <div style="display:flex;justify-content:space-between;font-size:.8rem;color:#5a7080;">
   <span>Progress</span>
-  <span><b>{n_locked}</b> / {len(ut_order)} publications done</span>
+  <span><b>{n_done}</b> / {len(ut_order)} done &nbsp;·&nbsp; <b>{n_need}</b> need decisions</span>
 </div>
 <div class="prog-bar-wrap"><div class="prog-bar-fill" style="width:{pct}%"></div></div>
 """, unsafe_allow_html=True)
@@ -417,16 +433,21 @@ with tab_review:
             st.session_state.ut_index = min(len(ut_order) - 1, idx + 1)
             st.rerun()
     with nav_c:
-        # Jump-to selectbox
+        # Jump-to selectbox — NO persistent key so label changes don't
+        # cause mismatches when a UT is locked/unlocked mid-session.
         ut_display = [
-            f"{'✅' if st.session_state.ut_locked.get(u) or _ut_status(u)=='skip' else '⏳'}  {u}"
+            f"{'✅' if _ut_is_done(u) else '⏳'}  {u}"
             for u in ut_order
         ]
-        jump = st.selectbox("Jump to publication", ut_display,
-                            index=idx, key="ut_jump", label_visibility="collapsed")
-        jumped = ut_order[ut_display.index(jump)]
-        if jumped != ut_order[idx]:
-            st.session_state.ut_index = ut_order.index(jumped)
+        jump = st.selectbox(
+            "Jump to publication",
+            ut_display,
+            index=idx,
+            label_visibility="collapsed",
+        )
+        jumped_idx = ut_display.index(jump)
+        if jumped_idx != idx:
+            st.session_state.ut_index = jumped_idx
             st.rerun()
 
     ut = ut_order[idx]
@@ -437,6 +458,14 @@ with tab_review:
     rev_rows   = _ut_needs_attention(ut)
     dup_rows   = _ut_already_uploaded(ut)
 
+    _card_badge = ""
+    if status == "locked":
+        _card_badge = "<span style='color:#27ae60;font-weight:600;margin-left:.8rem;'>✅ LOCKED</span>"
+    elif status == "skip":
+        _card_badge = "<span style='color:#888;margin-left:.8rem;'>⏭ all duplicates — auto-skipped</span>"
+    elif not rev_rows:
+        _card_badge = "<span style='color:#27ae60;margin-left:.8rem;'>✅ auto-done (no decisions needed)</span>"
+
     st.markdown(f"""
 <div class="ut-card">
   <div class="ut-id">{ut}</div>
@@ -444,8 +473,7 @@ with tab_review:
     <b>{len(auto_rows)}</b> auto-confirmed &nbsp;·&nbsp;
     <b>{len(rev_rows)}</b> need decision &nbsp;·&nbsp;
     <b>{len(dup_rows)}</b> already in MyOrg
-    {"&nbsp;&nbsp;<span style='color:#27ae60;font-weight:600;'>✅ LOCKED</span>" if status == "locked" else ""}
-    {"&nbsp;&nbsp;<span style='color:#888;'>⏭ all duplicates — auto-skipped</span>" if status == "skip" else ""}
+    {_card_badge}
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -482,8 +510,41 @@ with tab_review:
     if status == "locked":
         st.markdown('<div class="locked-ut">🔒 Publication confirmed — all authors resolved</div>',
                     unsafe_allow_html=True)
+
+        # Show a summary of every decision made for this UT
+        if rev_rows:
+            with st.expander(f"🗒 {len(rev_rows)} resolved author(s) — click to review", expanded=False):
+                for r in rev_rows:
+                    raw_a = r.get("AuthorFullName", r.get("author_full", ""))
+                    norm_r = normalize_name(raw_a)
+                    dec_r  = st.session_state.author_decs.get((norm_r, ut), {})
+                    action = dec_r.get("action", "approve")
+                    mt_r   = dec_r.get("match_type", r.get("match_type", "new"))
+                    badge_map_r = {
+                        "initial_expansion": ("badge-initial", "INITIAL"),
+                        "fuzzy":             ("badge-fuzzy",   "FUZZY"),
+                        "new":               ("badge-new",     "NEW"),
+                        "resolved":          ("badge-exact",   "RESOLVED"),
+                    }
+                    bcls_r, blbl_r = badge_map_r.get(mt_r, ("badge-new", mt_r.upper()))
+                    if action == "reject":
+                        st.markdown(
+                            f'<span class="badge badge-dup">REJECTED</span> '                            f'<b>{raw_a}</b>',
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        org_ids_r = [o for o in dec_r.get("org_ids", []) if o]
+                        org_str_r = " ".join(f'<span class="chip">{o}</span>' for o in org_ids_r) or "—"
+                        st.markdown(
+                            f'<span class="badge {bcls_r}">{blbl_r}</span> '                            f'<b>{raw_a}</b> → '                            f'{dec_r.get("resolved_name", raw_a)} '                            f'[{dec_r.get("resolved_pid", "")}] '                            f'{org_str_r}',
+                            unsafe_allow_html=True,
+                        )
+
+        # Unlock must stay on this UT — do NOT advance index
         if st.button("🔓 Unlock to re-edit", key=f"unlock_{ut}"):
             st.session_state.ut_locked[ut] = False
+            # Stay on this UT — explicitly write back the current index
+            st.session_state.ut_index = idx
             st.rerun()
 
     elif status == "skip":
@@ -594,16 +655,31 @@ with tab_review:
 
                     else:
                         # New person — search picker
+                        search_key    = _safe_key("search", norm, ut)
+                        pick_key      = _safe_key("search_pick", norm, ut)
+                        NEW_LBL = f"➕ Create as NEW PERSON  (ID {r.get('suggested_pid','')})"
+
+                        # Read last saved query; default to raw author name on first render
+                        prev_query = dec.get("_search", raw_author)
+
                         sq = st.text_input(
                             f"Search existing for **{raw_author}**",
-                            value=dec.get("_search", raw_author),
-                            key=_safe_key("search", norm, ut),
+                            value=prev_query,
+                            key=search_key,
                             disabled=decided,
+                            placeholder="Type a name and press Enter…",
                         )
-                        dec["_search"] = sq
+
+                        # Detect when the user has changed the query and clear the
+                        # selectbox widget state so it resets to the new results list.
+                        if sq != prev_query:
+                            dec["_search"] = sq
+                            dec["_search_choice"] = NEW_LBL   # reset selection
+                            # Wipe the selectbox widget state so Streamlit re-renders
+                            # it from index= instead of from stale session_state value
+                            st.session_state.pop(pick_key, None)
 
                         hits = search_persons(sq, person_index)
-                        NEW_LBL = f"➕ Create as NEW PERSON  (ID {r.get('suggested_pid','')})"
                         opts = [NEW_LBL] + [
                             f"[{hp['PersonID']}] {hp['AuthorFullName']}  ·  {int(hs*100)}%"
                             for hs, hp in hits
@@ -612,6 +688,14 @@ with tab_review:
                             f"[{hp['PersonID']}] {hp['AuthorFullName']}  ·  {int(hs*100)}%": hp
                             for hs, hp in hits
                         }
+
+                        # Show hit count hint below the text box
+                        if sq and sq != raw_author:
+                            if hits:
+                                st.caption(f"🔍 {len(hits)} match{'es' if len(hits)!=1 else ''} found")
+                            else:
+                                st.caption("No matches — will create as new person")
+
                         saved_s = dec.get("_search_choice", NEW_LBL)
                         s_def   = opts.index(saved_s) if saved_s in opts else 0
 
@@ -619,10 +703,12 @@ with tab_review:
                             f"Identity for **{raw_author}**",
                             opts,
                             index=s_def,
-                            key=_safe_key("search_pick", norm, ut),
+                            key=pick_key,
                             disabled=decided,
                         )
+                        # Persist current choice and the query that produced it
                         dec["_search_choice"] = sch
+                        dec["_search"] = sq
 
                         if not dec.get("_override_pid"):
                             if sch == NEW_LBL:
@@ -654,17 +740,30 @@ with tab_review:
                                     _set_dec(norm, ut, dec)
                                     st.rerun()
 
+                            ovr_q_key    = _safe_key("ovr_q",    norm, ut)
+                            ovr_pick_key = _safe_key("ovr_pick", norm, ut)
+                            prev_ovq = dec.get("_override_query", "")
+
                             ovq = st.text_input(
                                 "Search",
-                                value=dec.get("_override_query", ""),
-                                key=_safe_key("ovr_q", norm, ut),
+                                value=prev_ovq,
+                                key=ovr_q_key,
                                 disabled=decided,
+                                placeholder="Type a name and press Enter…",
                             )
+
+                            # Clear selectbox state when query changes
+                            if ovq != prev_ovq:
+                                dec["_override_query"] = ovq
+                                dec.pop("_override_choice", None)
+                                st.session_state.pop(ovr_pick_key, None)
+
                             dec["_override_query"] = ovq
 
                             if ovq:
                                 oh = search_persons(ovq, person_index)
                                 if oh:
+                                    st.caption(f"🔍 {len(oh)} match{'es' if len(oh)!=1 else ''} found")
                                     NEW_OVR = f"➕ Create as NEW PERSON  (ID {r.get('suggested_pid','')})"
                                     o_opts  = [NEW_OVR] + [
                                         f"[{hp['PersonID']}] {hp['AuthorFullName']}  ·  {int(hs*100)}%"
@@ -680,7 +779,7 @@ with tab_review:
                                         "Select",
                                         o_opts,
                                         index=o_def,
-                                        key=_safe_key("ovr_pick", norm, ut),
+                                        key=ovr_pick_key,
                                         disabled=decided,
                                     )
                                     dec["_override_choice"] = oc
@@ -806,9 +905,7 @@ with tab_review:
     with st.sidebar:
         st.markdown("### Publication list")
         for i, u in enumerate(ut_order):
-            s = _ut_status(u)
-            icon = "✅" if s in ("locked","skip") else ("⏳" if _ut_needs_attention(u) else "—")
-            style = "color:#27ae60;font-weight:600;" if s in ("locked","skip") else ""
+            icon = "✅" if _ut_is_done(u) else ("⏳" if _ut_needs_attention(u) else "—")
             if st.button(f"{icon} {u}", key=f"sb_{i}", use_container_width=True):
                 st.session_state.ut_index = i
                 st.rerun()
@@ -952,3 +1049,300 @@ with tab_export:
                 mime="text/csv",
                 use_container_width=True,
             )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — UPLOAD TO MYORG API
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_upload:
+    st.markdown("""
+<style>
+.upload-row {
+    display:flex; align-items:center; gap:.7rem;
+    padding:.45rem .9rem; border-radius:5px; margin:.2rem 0;
+    font-family:'IBM Plex Mono',monospace; font-size:.78rem;
+}
+.upload-row.ok      { background:#f0faf4; border-left:3px solid #27ae60; }
+.upload-row.skip    { background:#f5f5f5; border-left:3px solid #aaa; }
+.upload-row.error   { background:#fff5f5; border-left:3px solid #e74c3c; }
+.upload-row.pending { background:#fefaf0; border-left:3px solid #e67e22; }
+.up-icon { font-size:1rem; min-width:1.2rem; }
+.up-pid  { color:#1a9dc8; min-width:5rem; }
+.up-name { color:#2c3e50; min-width:16rem; }
+.up-ut   { color:#7a8fa0; min-width:16rem; }
+.up-msg  { color:#555; }
+.stat-pill {
+    display:inline-block; padding:.2rem .7rem; border-radius:20px;
+    font-size:.75rem; font-weight:600; margin-right:.4rem;
+    font-family:'IBM Plex Mono',monospace;
+}
+.pill-ok    { background:#d4edda; color:#155724; }
+.pill-skip  { background:#e2e3e5; color:#383d41; }
+.pill-err   { background:#f8d7da; color:#721c24; }
+.pill-total { background:#d1ecf1; color:#0c5460; }
+</style>
+""", unsafe_allow_html=True)
+
+    st.markdown('<div class="sec-head">MyOrg API Upload</div>', unsafe_allow_html=True)
+
+    if not st.session_state.processed:
+        st.info("⬅️ Complete Tabs 1–3 first.")
+        st.stop()
+
+    if not st.session_state.finalized:
+        st.warning("⚠️ Finalise your decisions in Tab 3 before uploading.")
+        st.stop()
+
+    output_rows = st.session_state.output_rows
+    if not output_rows:
+        st.info("No rows to upload — all entries were excluded.")
+        st.stop()
+
+    # ── API key input ─────────────────────────────────────────────────────────
+    st.markdown("#### 1 · API credentials")
+    col_key, col_mode = st.columns([3, 1])
+    with col_key:
+        api_key = st.text_input(
+            "Clarivate API Key",
+            type="password",
+            key="api_key_input",
+            placeholder="Paste your X-ApiKey here…",
+            help="Your Clarivate developer key — never stored or logged",
+        )
+    with col_mode:
+        dry_run = st.checkbox(
+            "🔬 Dry run",
+            value=True,
+            key="dry_run_toggle",
+            help="Simulate all API calls without actually sending data. "
+                 "Uncheck only when ready to go live.",
+        )
+        if dry_run:
+            st.caption("No real calls will be made.")
+        else:
+            st.caption("⚠️ Live mode — real calls.")
+
+    if not api_key and not dry_run:
+        st.error("Enter your API key, or enable Dry Run to test without one.")
+        st.stop()
+
+    # ── Connection test ───────────────────────────────────────────────────────
+    st.markdown("#### 2 · Test connection")
+    if st.button("🔌 Test API connection", key="test_conn_btn"):
+        client = MyOrgClient(api_key or "test", dry_run=dry_run)
+        with st.spinner("Testing…"):
+            res = client.test_connection()
+        if res.success:
+            st.success(f"✅ {res.message}")
+        else:
+            st.error(f"❌ {res.message}")
+
+    # ── Upload plan preview ───────────────────────────────────────────────────
+    st.markdown("#### 3 · Upload plan")
+
+    # Classify rows: new person vs existing person
+    new_person_pids = {
+        r.get("PersonID", "")
+        for r in output_rows
+        if r.get("match_type") == "new"
+    }
+    # Build name lookup from author_decs
+    new_person_names: dict[str, tuple[str, str]] = {}  # pid → (first, last)
+    for (norm_k, ut_k), dec in st.session_state.author_decs.items():
+        if dec.get("match_type") == "new" and dec.get("action") == "approve":
+            pid  = str(dec.get("resolved_pid", "")).strip()
+            name = dec.get("resolved_name", "")
+            if pid and "," in name:
+                last, _, first = name.partition(",")
+                new_person_names[pid] = (first.strip(), last.strip())
+            elif pid:
+                new_person_names[pid] = ("", name.strip())
+
+    n_new = sum(1 for r in output_rows if r.get("PersonID","") in new_person_pids)
+    n_exist = len(output_rows) - n_new
+
+    st.markdown(f"""
+<div class="metric-grid">
+  <div class="metric-card">
+    <div class="num num-blue">{len(output_rows)}</div>
+    <div class="lbl">Total rows to upload</div>
+  </div>
+  <div class="metric-card">
+    <div class="num num-green">{n_new}</div>
+    <div class="lbl">New persons to create</div>
+  </div>
+  <div class="metric-card">
+    <div class="num">{n_exist}</div>
+    <div class="lbl">Existing persons / new pubs</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+    with st.expander("Preview rows to upload", expanded=False):
+        prev_df = pd.DataFrame(output_rows)[["PersonID","AuthorFullName","UT","OrganizationID","match_type"]]
+        prev_df["is_new_person"] = prev_df["PersonID"].isin(new_person_pids)
+        st.dataframe(prev_df, use_container_width=True, height=260)
+
+    # ── Upload controls ───────────────────────────────────────────────────────
+    st.markdown("#### 4 · Run upload")
+
+    delay = st.slider(
+        "Delay between API calls (seconds)",
+        min_value=0.0, max_value=2.0, value=0.3, step=0.1,
+        help="Throttle to avoid rate-limit errors. 0.3 s is safe for most keys.",
+        key="upload_delay",
+    )
+
+    col_start, col_reset = st.columns([2, 1])
+    with col_reset:
+        if st.button("🗑 Reset upload log", key="reset_upload"):
+            st.session_state.upload_log  = []
+            st.session_state.upload_done = False
+            st.rerun()
+    with col_start:
+        already_done = st.session_state.upload_done
+        start_label  = "✅ Upload complete — click to re-run" if already_done else (
+            f"🚀 {'Simulate' if dry_run else 'Start'} upload  ({len(output_rows)} rows)"
+        )
+        run_upload = st.button(
+            start_label,
+            type="primary",
+            use_container_width=True,
+            key="run_upload_btn",
+        )
+
+    # ── Live upload execution ─────────────────────────────────────────────────
+    if run_upload:
+        st.session_state.upload_log  = []
+        st.session_state.upload_done = False
+
+        client = MyOrgClient(api_key or "test", dry_run=dry_run)
+
+        progress_bar  = st.progress(0)
+        status_text   = st.empty()
+        log_container = st.container()
+        n_total = len(output_rows)
+
+        for i, row in enumerate(output_rows):
+            pid  = str(row.get("PersonID","")).strip()
+            oid  = str(row.get("OrganizationID","")).strip()
+            ut   = str(row.get("UT","")).strip()
+            name = row.get("AuthorFullName","")
+            is_new = pid in new_person_pids
+
+            first_name, last_name = new_person_names.get(pid, ("", ""))
+            if not first_name and not last_name and "," in name:
+                last_name, _, first_name = name.partition(",")
+                first_name = first_name.strip()
+                last_name  = last_name.strip()
+
+            status_text.markdown(
+                f"<small>Uploading {i+1}/{n_total} — "
+                f"<b>{name}</b> / {ut}</small>",
+                unsafe_allow_html=True,
+            )
+
+            result = client.upload_row(
+                row=row,
+                is_new_person=is_new,
+                first_name=first_name,
+                last_name=last_name,
+                delay=delay,
+            )
+
+            log_entry = {
+                "idx":       i + 1,
+                "pid":       pid,
+                "name":      name,
+                "ut":        ut,
+                "oid":       oid,
+                "is_new":    is_new,
+                "overall":   result["overall"],
+                "p_status":  result["person_step"].status if result["person_step"] else None,
+                "p_msg":     result["person_step"].message if result["person_step"] else "",
+                "pub_status": result["pub_step"].status if result["pub_step"] else None,
+                "pub_msg":   result["pub_step"].message if result["pub_step"] else "",
+            }
+            st.session_state.upload_log.append(log_entry)
+            progress_bar.progress((i + 1) / n_total)
+
+        status_text.empty()
+        st.session_state.upload_done = True
+        st.rerun()
+
+    # ── Results display ───────────────────────────────────────────────────────
+    if st.session_state.upload_log:
+        log = st.session_state.upload_log
+        n_ok    = sum(1 for e in log if e["overall"] == "ok")
+        n_skip  = sum(1 for e in log if e["overall"] == "skipped")
+        n_err   = sum(1 for e in log if e["overall"] == "error")
+
+        done_label = "✅ Upload complete" if st.session_state.upload_done else "⏳ In progress"
+        st.markdown(f"""
+<div style="margin:1rem 0 .5rem;">
+  <b>{done_label}</b> &nbsp;
+  <span class="stat-pill pill-total">{len(log)} processed</span>
+  <span class="stat-pill pill-ok">✓ {n_ok} uploaded</span>
+  <span class="stat-pill pill-skip">⏭ {n_skip} skipped (already exists)</span>
+  <span class="stat-pill pill-err">✗ {n_err} errors</span>
+</div>
+""", unsafe_allow_html=True)
+
+        # Filter tabs
+        filt = st.radio(
+            "Show",
+            ["All", "Uploaded", "Skipped", "Errors"],
+            horizontal=True,
+            key="upload_log_filter",
+        )
+
+        icon_map = {"ok": "✅", "skipped": "⏭", "error": "❌"}
+        cls_map  = {"ok": "ok", "skipped": "skip", "error": "error"}
+
+        for entry in log:
+            overall = entry["overall"]
+            if filt == "Uploaded" and overall != "ok":       continue
+            if filt == "Skipped"  and overall != "skipped":  continue
+            if filt == "Errors"   and overall != "error":     continue
+
+            icon = icon_map.get(overall, "⏳")
+            cls  = cls_map.get(overall, "pending")
+            new_badge = ' <span style="color:#9b59b6;font-size:.7rem;">NEW</span>' \
+                        if entry["is_new"] else ""
+            p_info  = f"person:{entry['p_status']}" if entry["p_status"] else ""
+            pub_info = f"pub:{entry['pub_status']}"  if entry["pub_status"] else ""
+            detail  = " · ".join(filter(None, [p_info, pub_info, entry["pub_msg"]]))
+
+            st.markdown(f"""
+<div class="upload-row {cls}">
+  <span class="up-icon">{icon}</span>
+  <span class="up-pid">{entry['pid']}</span>
+  <span class="up-name">{entry['name']}{new_badge}</span>
+  <span class="up-ut">{entry['ut']}</span>
+  <span class="up-msg">{detail[:120]}</span>
+</div>
+""", unsafe_allow_html=True)
+
+        # ── Error detail expander ─────────────────────────────────────────────
+        errors = [e for e in log if e["overall"] == "error"]
+        if errors:
+            with st.expander(f"⚠ {len(errors)} error(s) — click to inspect", expanded=True):
+                for e in errors:
+                    st.markdown(
+                        f"**{e['name']}** (ID {e['pid']}) / `{e['ut']}`  \n"
+                        f"Person step: `{e['p_msg']}`  \n"
+                        f"Pub step: `{e['pub_msg']}`"
+                    )
+                    st.markdown("---")
+
+        # ── Download log ──────────────────────────────────────────────────────
+        st.markdown("")
+        log_df = pd.DataFrame(log)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        st.download_button(
+            "⬇️ Download upload log CSV",
+            data=log_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"upload_log_{ts}.csv",
+            mime="text/csv",
+            use_container_width=False,
+        )

@@ -112,20 +112,52 @@ class MyOrgClient:
                 f"[DRY RUN] Would add person {person_id} ({last_name}, {first_name}) "
                 f"→ org {org_id}")
 
-        body = [{
-            "personId":   person_id,
+        # Do NOT send personId — the API auto-assigns its own ID.
+        # Sending our internal staging ID causes conflicts.
+        entry: dict = {
             "firstName":  first_name,
             "lastName":   last_name,
-            "email":      email,
-            "otherNames": other_names,
             "organizations": [{"organizationId": org_id}],
-        }]
+        }
+        if email:
+            entry["email"] = email
+        if other_names:
+            entry["otherNames"] = other_names
+
         try:
-            resp = self._post("/persons", body)
-            result = self._result(resp, ok_codes=(200, 201))
-            if resp.status_code == 409:
-                result.message = "Person already exists (409)"
-            return result
+            resp = self._post("/persons", [entry])
+
+            # Parse the PersonsWithStatus response
+            if resp.status_code in (200, 201):
+                try:
+                    items = resp.json()
+                    if isinstance(items, list) and items:
+                        item = items[0]
+                        assigned_id = item.get("personId", "")
+                        err = item.get("error", "")
+                        if err:
+                            already = "already" in err.lower()
+                            return ApiResult(False, 409 if already else 400,
+                                             err, item)
+                        return ApiResult(True, 201,
+                                         f"Created — assigned PersonID: {assigned_id}",
+                                         item)
+                except Exception:
+                    pass
+                return ApiResult(True, 201, "Person created")
+
+            # Non-2xx: try to extract error from PersonsWithStatus array
+            msg = resp.reason or str(resp.status_code)
+            try:
+                items = resp.json()
+                if isinstance(items, list) and items:
+                    item = items[0]
+                    msg = item.get("error") or str(item.get("status","")) or msg
+            except Exception:
+                pass
+            already = "already" in msg.lower() or resp.status_code == 409
+            return ApiResult(False, 409 if already else resp.status_code, msg)
+
         except requests.RequestException as exc:
             return ApiResult(False, 0, f"Network error: {exc}")
 
@@ -243,12 +275,21 @@ class MyOrgClient:
 
         Strategy
         --------
-        1. If is_new_person → POST /persons to create and associate
-        2. Then POST /publications to link the document
+        Step 1 — ensure the person-org association exists:
+          • New person  → POST /persons  (creates + associates to org)
+          • Known person → POST /organizations/{org}/persons/{pid}  (associate)
 
-        Returns a status dict with keys:
+        Step 2 — link the publication (two-attempt approach):
+          • Attempt A: POST /publications
+              Creates the publication in the dataset AND links it.
+              Use when the UT may not yet exist in MyOrg.
+          • Attempt B (if A returns "Publication already exists"):
+              POST /organizations/{org}/persons/{pid}/publications/{pubId}
+              The pub already exists in MyOrg — just link it to this person-org.
+
+        Returns a dict with keys:
           person_step : ApiResult
-          pub_step    : ApiResult
+          pub_step    : ApiResult   (result of whichever pub attempt succeeded)
           overall     : 'ok' | 'skipped' | 'error'
         """
         pid = str(row.get("PersonID", "")).strip()
@@ -268,32 +309,57 @@ class MyOrgClient:
 
         result = {"person_step": None, "pub_step": None, "overall": "ok"}
 
-        # ── Step 1: ensure person exists in the org ──────────────────────────
+        # ── Step 1: ensure person-org association exists ──────────────────────
         if is_new_person:
             p_res = self.add_person(pid, first_name, last_name, oid)
             result["person_step"] = p_res
-            if not p_res.success and p_res.status != 409:
+            # Continue to pub step regardless — only hard-stop on network error.
+            if p_res.status == 0:
                 result["overall"] = "error"
                 return result
         else:
-            # Person exists — ensure org association exists
             p_res = self.associate_person_org(pid, oid)
             result["person_step"] = p_res
-            # 409 = already associated, which is fine
-            if not p_res.success and p_res.status != 409:
+            # 409 = already associated = fine. Network error = stop.
+            if p_res.status == 0:
                 result["overall"] = "error"
                 return result
 
         if delay > 0 and not self.dry_run:
             time.sleep(delay)
 
-        # ── Step 2: link the publication ─────────────────────────────────────
+        # ── Step 2A: try POST /publications ──────────────────────────────────
+        # Creates the publication in MyOrg and links it to the person-org pair.
         pub_res = self.add_publication(ut, pid, oid)
-        result["pub_step"] = pub_res
+
+        if pub_res.success:
+            # Successfully created and linked
+            result["pub_step"] = pub_res
+            result["overall"]  = "ok"
+            return result
 
         if pub_res.status == 409:
-            result["overall"] = "skipped"   # already linked
-        elif not pub_res.success:
+            # "Publication already exists" — the UT is already in the MyOrg dataset.
+            # Fall through to Step 2B to link it via the dedicated endpoint.
+            pass
+        else:
+            # Real error (network failure, bad request, etc.) — stop here.
+            result["pub_step"] = pub_res
+            result["overall"]  = "error"
+            return result
+
+        if delay > 0 and not self.dry_run:
+            time.sleep(delay)
+
+        # ── Step 2B: POST /organizations/{org}/persons/{pid}/publications/{pub} ─
+        # Publication already exists in MyOrg — link it to this person-org pair.
+        link_res = self.link_existing_publication(ut, pid, oid)
+        result["pub_step"] = link_res
+
+        if link_res.success or link_res.status == 409:
+            # 201 = linked, 409 = already linked to this person-org → both are success
+            result["overall"] = "ok" if link_res.success else "skipped"
+        else:
             result["overall"] = "error"
 
         return result

@@ -266,6 +266,7 @@ def _show_ut_upload_section(ut):
                     "is_new": row["is_new"], "overall": res["overall"],
                     "p_msg":   res["person_step"].message if res["person_step"] else "",
                     "pub_msg": res["pub_step"].message    if res["pub_step"]    else "",
+                    "was_dry": dry_run,
                 })
                 prog.progress((i + 1) / len(rows))
             st.session_state.upload_log[ut]     = ut_log
@@ -284,7 +285,8 @@ def _show_ut_upload_section(ut):
         n_ok   = sum(1 for e in log if e["overall"] == "ok")
         n_skip = sum(1 for e in log if e["overall"] == "skipped")
         n_err  = sum(1 for e in log if e["overall"] == "error")
-        mode   = "🔬 Simulated" if dry_run else "✅ Uploaded"
+        was_dry = log[0].get("was_dry", dry_run) if log else dry_run
+        mode    = "🔬 Simulated (dry run)" if was_dry else "✅ Uploaded to MyOrg"
         st.markdown(
             f'<div style="font-size:.82rem;margin:.4rem 0 .6rem;">'
             f'<b>{mode}</b> &nbsp; '
@@ -296,7 +298,8 @@ def _show_ut_upload_section(ut):
         for e in log:
             icon = {"ok":"✅","skipped":"⏭","error":"❌"}.get(e["overall"],"⏳")
             nb   = " <b style='color:#9b59b6;font-size:.7rem;'>NEW</b>" if e["is_new"] else ""
-            msg  = (e.get("pub_msg") or e.get("p_msg") or "")[:100]
+            raw_msg = e.get("pub_msg") or e.get("p_msg") or ""
+            msg = raw_msg.replace("[DRY RUN] ", "").replace("[DRY RUN]", "")[:100]
             st.markdown(
                 f'<div class="upl-result {e["overall"]}">'
                 f'<span>{icon}</span>'
@@ -751,7 +754,9 @@ with tab_log:
             for e in entries:
                 icon={"ok":"✅","skipped":"⏭","error":"❌"}.get(e["overall"],"⏳")
                 nb=" <b style='color:#9b59b6;font-size:.7rem;'>NEW</b>" if e["is_new"] else ""
-                msg=(e.get("pub_msg") or e.get("p_msg") or "")[:120]
+                raw_m = e.get("pub_msg") or e.get("p_msg") or ""
+                clean = raw_m.replace("[DRY RUN] ","").replace("[DRY RUN]","")[:120]
+                msg   = f"(dry run) {clean}" if e.get("was_dry") else clean
                 st.markdown(
                     f'<div class="upl-result {e["overall"]}">'
                     f'<span>{icon}</span><span class="r-pid">{e["pid"]}</span>'

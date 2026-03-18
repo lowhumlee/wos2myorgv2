@@ -220,7 +220,19 @@ def _is_muv_affiliation(affil_norm: str, patterns: list[str]) -> bool:
         "paraskev stoyanov",                    # minimal form without city
     ]
     all_patterns = list(patterns) + FALLBACK_PATTERNS
-    return any(p in affil_norm for p in all_patterns)
+    if any(p in affil_norm for p in all_patterns):
+        return True
+    # "Med Univ Bulgaria, ..., Varna" — WoS uses country name instead of city
+    if "med univ bulgaria" in affil_norm and "varna" in affil_norm:
+        return True
+    # "Med Univ, ..., Varna" — two-word abbreviated institution name, city in address
+    # Only match when varna is the city (not sofia/plovdiv/pleven)
+    if affil_norm.startswith("med univ,") or (
+            affil_norm.startswith("med univ ") and "varna" in affil_norm and
+            not any(c in affil_norm for c in ("sofia", "plovdiv", "pleven", "stara zagora"))):
+        if "varna" in affil_norm:
+            return True
+    return False
 
 
 def extract_muv_author_pairs(wos_records: List[Dict], cfg: dict) -> List[Dict]:

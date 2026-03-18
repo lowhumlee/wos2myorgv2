@@ -75,13 +75,19 @@ st.markdown('<div class="app-header"><h1>🔬 WoS → MyOrg</h1>'
             '</div>', unsafe_allow_html=True)
 
 # ── Session state ─────────────────────────────────────────────────────────────
+# Load API key from config.json if present and not yet in session
+_cfg_for_key = load_config("config.json")
+_cfg_api_key = _cfg_for_key.get("api_key", "").strip()
+
 for k, v in {
     "processed": False, "ut_order": [], "ut_index": 0,
     "ut_locked": {}, "author_decs": {}, "batch_result": None,
     "person_index": [], "existing_pairs": set(), "orgs": [], "cfg": {},
     "source_file": "", "max_pid": 0,
     "ut_rows_cache": {}, "ut_upload_done": {}, "upload_log": {},
-    "global_api_key": "", "global_dry_run": True,
+    # Seed API key from config; dry_run=False when a key is configured
+    "global_api_key": _cfg_api_key,
+    "global_dry_run": not bool(_cfg_api_key),
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -319,10 +325,13 @@ def _show_ut_upload_section(ut):
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### ⚙️ API Settings")
+    _has_cfg_key = bool(load_config("config.json").get("api_key","").strip())
+    _key_hint    = "Loaded from config.json" if _has_cfg_key else "Paste X-ApiKey here…"
     key_in = st.text_input("Clarivate API Key", type="password",
                            value=st.session_state.global_api_key,
-                           placeholder="Paste X-ApiKey here…",
-                           key="sidebar_api_key")
+                           placeholder=_key_hint,
+                           key="sidebar_api_key",
+                           help="Key is pre-loaded from config.json. Type here to override for this session.")
     if key_in != st.session_state.global_api_key:
         st.session_state.global_api_key = key_in
 

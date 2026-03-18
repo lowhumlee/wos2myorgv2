@@ -175,19 +175,23 @@ class MyOrgClient:
                     items = resp.json()
                     if isinstance(items, list) and items:
                         item = items[0]
-                        # Check per-item status
+                        # Collect error message from either location in the response:
+                        # - item["error"]           (top-level, e.g. "Publication already exists")
+                        # - item["persons"][0]["error"]  (per-person error)
                         persons = item.get("persons", [])
-                        if persons and persons[0].get("error"):
-                            err = persons[0]["error"]
+                        err = (
+                            (persons[0].get("error") if persons else None)
+                            or item.get("error")
+                            or ""
+                        )
+                        if err:
                             already = "already" in err.lower() or "409" in str(err)
                             return ApiResult(
-                                success=not already or False,
+                                success=False,
                                 status=409 if already else 400,
                                 message=err,
                                 payload=item,
                             )
-                        if item.get("error"):
-                            return ApiResult(False, 400, item["error"], item)
                         return ApiResult(True, 200, "Linked successfully", item)
                 except Exception:
                     pass
